@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # XAUUSD Realtime Simple Flask - single file
-# Login: admin / admin123
 # Run: pip install flask requests werkzeug && python xauusd_realtime_simple_pro.py
 
 import os, csv, io, math, sqlite3
@@ -1781,7 +1780,7 @@ body{
     <input class="input" type="password" name="password" placeholder="Password" autocomplete="current-password">
     <button class="btn" type="submit">→ Masuk</button>
     <div class="loading" id="load">⏳ Memproses...</div>
-    <div class="footer">Default: admin / admin123</div>
+    <div class="footer">Created By Devin Dimas</div>
 </form>
 </body>
 </html>
