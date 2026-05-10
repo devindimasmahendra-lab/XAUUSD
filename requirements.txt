@@ -1,3 +1,6 @@
 flask
-flask-sock
+flask-socketio
 gunicorn
+gevent
+pillow
+requests
