@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 # XAUUSD Realtime Simple Flask - single file
+# Login: admin / admin123
 # Run: pip install flask requests werkzeug && python xauusd_realtime_simple_pro.py
 
-import os, csv, io, math, sqlite3
+import os, csv, io, math, sqlite3, re
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
@@ -10,6 +11,21 @@ try:
     import requests
 except Exception:
     requests = None
+
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
+try:
+    import lxml
+except Exception:
+    pass
 
 from flask import Flask, request, jsonify, render_template_string, redirect, session, Response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -120,6 +136,8 @@ def init_db():
         "default_tf": "15min",
         "twelvedata_api_key": os.getenv("TWELVEDATA_API_KEY", ""),
         "initial_balance": "1000",
+        "balance_credit": "1000",
+        "virtual_balance_enabled": "1",
         "risk_percent": "1",
         "pip_value_per_lot": "1",
         "refresh_seconds": "10",
@@ -135,7 +153,6 @@ def init_db():
         cur.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
 
     # ===== MIGRATIONS =====
-    # Add new columns to active_trades if not exist
     existing_cols = [row[1] for row in cur.execute("PRAGMA table_info(active_trades)").fetchall()]
     migration_cols = {
         "close_price": "REAL",
@@ -169,6 +186,21 @@ def set_setting(key, value):
     )
     conn.commit()
     conn.close()
+
+
+def get_balance_credit():
+    default_balance = get_setting("initial_balance", "1000")
+    return safe_float(get_setting("balance_credit", default_balance), safe_float(default_balance, 1000))
+
+
+def set_balance_credit(amount):
+    amount = max(0, safe_float(amount))
+    set_setting("balance_credit", round(amount, 2))
+    return round(amount, 2)
+
+
+def adjust_balance_credit(delta):
+    return set_balance_credit(get_balance_credit() + safe_float(delta))
 
 
 # ============================================================
@@ -280,10 +312,7 @@ def tf_minutes(tf):
     }.get(tf, 15)
 
 
-def demo_candles(n=220, tf="15min"):
-    """
-    Data demo kalau API key belum diisi.
-    """
+def demo_candles(n=150, tf="15min"):
     out = []
     price = 2350.0
     step = tf_minutes(tf)
@@ -316,49 +345,99 @@ def fetch_json(url, params):
     return r.json()
 
 
-def fetch_candles(tf="15min", size=220):
-    """
-    Near realtime candle:
-    - mengambil candle terbaru dari Twelve Data REST API
-    - browser auto-refresh setiap beberapa detik
-    """
+def fetch_candles(tf="15min", size=150):
     tf = tf_ok(tf)
+
+    # Priority 1: Yahoo Finance (gratis)
+    yf_candles, yf_status = fetch_candles_yfinance(tf, size)
+    if yf_status == "YAHOO FINANCE (GRATIS)":
+        return yf_candles, yf_status
+
+    # Priority 2: Twelve Data (butuh API key)
     key = get_setting("twelvedata_api_key")
     symbol = get_setting("symbol", "XAU/USD")
 
-    if not key:
-        return demo_candles(size, tf), "DEMO - isi Twelve Data API Key untuk data real"
+    if key:
+        try:
+            data = fetch_json(
+                "https://api.twelvedata.com/time_series",
+                {
+                    "symbol": symbol,
+                    "interval": tf,
+                    "outputsize": size,
+                    "apikey": key,
+                    "timezone": "Asia/Jakarta",
+                    "order": "ASC",
+                }
+            )
+
+            if "values" in data:
+                rows = []
+                for x in data["values"]:
+                    rows.append({
+                        "time": x.get("datetime"),
+                        "open": safe_float(x.get("open")),
+                        "high": safe_float(x.get("high")),
+                        "low": safe_float(x.get("low")),
+                        "close": safe_float(x.get("close")),
+                    })
+                return rows, "REAL DATA (Twelve Data)"
+
+        except Exception:
+            pass
+
+    # Fallback
+    if not yf_status.startswith("yfinance"):
+        return yf_candles, yf_status
+
+    return demo_candles(size, tf), "DEMO - semua sumber data gagal"
+
+
+def fetch_candles_yfinance(tf="15min", size=150):
+    tf = tf_ok(tf)
+    if yf is None:
+        return demo_candles(size, tf), "yfinance tidak terinstall, fallback demo"
+
+    tf_map = {
+        "1min": "1m", "3min": "5m", "5min": "5m",
+        "15min": "15m", "30min": "30m", "45min": "30m",
+        "1h": "60m", "2h": "60m", "4h": "60m",
+        "1day": "1d"
+    }
+    interval = tf_map.get(tf, "15m")
+
+    period_map = {
+        "1m": "1d", "5m": "2d", "15m": "5d", "30m": "1mo",
+        "60m": "1mo", "1d": "3mo"
+    }
+    period = period_map.get(interval, "1mo")
 
     try:
-        data = fetch_json(
-            "https://api.twelvedata.com/time_series",
-            {
-                "symbol": symbol,
-                "interval": tf,
-                "outputsize": size,
-                "apikey": key,
-                "timezone": "Asia/Jakarta",
-                "order": "ASC",
-            }
+        df = yf.download(
+            tickers="GC=F",
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=True
         )
-
-        if "values" not in data:
-            return demo_candles(size, tf), "API error: " + data.get("message", "unknown")
-
-        rows = []
-        for x in data["values"]:
-            rows.append({
-                "time": x.get("datetime"),
-                "open": safe_float(x.get("open")),
-                "high": safe_float(x.get("high")),
-                "low": safe_float(x.get("low")),
-                "close": safe_float(x.get("close")),
-            })
-
-        return rows, "REAL DATA"
-
     except Exception as e:
-        return demo_candles(size, tf), "Fallback demo: " + str(e)
+        return demo_candles(size, tf), f"yfinance error: {e}"
+
+    if df is None or df.empty:
+        return demo_candles(size, tf), "yfinance: data kosong"
+
+    rows = []
+    for idx, row in df.iterrows():
+        dt_str = idx.strftime("%Y-%m-%d %H:%M:%S") if hasattr(idx, 'strftime') else str(idx)
+        rows.append({
+            "time": dt_str,
+            "open": round(float(row.iloc[0]), 2),
+            "high": round(float(row.iloc[1]), 2),
+            "low": round(float(row.iloc[2]), 2),
+            "close": round(float(row.iloc[3]), 2),
+        })
+
+    return rows[-size:], "YAHOO FINANCE (GRATIS)"
 
 
 # ============================================================
@@ -541,38 +620,28 @@ def adx(candles, period=14):
 
 
 def is_good_trading_hour():
-    """
-    XAUUSD optimal trading hours:
-    Sesi London + New York overlap: 14.00 - 00.00 WIB
-    Di luar jam ini likuiditas rendah, spread besar, banyak noise
-    """
     hour = datetime.now(TZ).hour
     return 13 <= hour <= 23
 
 
 def detect_sideways(adx_val, bb_width, bb_width_ma):
-    """Deteksi apakah pasar sedang dalam kondisi range/sideways"""
     if adx_val < 22 and bb_width < bb_width_ma * 0.85:
         return True
     return False
 
 
 def detect_support_resistance(candles, lookback=15):
-    """Deteksi level Support & Resistance dari swing high/low terakhir"""
     highs = [x["high"] for x in candles[-lookback:]]
     lows = [x["low"] for x in candles[-lookback:]]
     supports = []
     resistances = []
     
     for i in range(1, len(highs)-1):
-        # Swing high: candle tengah lebih tinggi dari tetangga
         if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
             resistances.append(highs[i])
-        # Swing low: candle tengah lebih rendah dari tetangga
         if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
             supports.append(lows[i])
     
-    # Ambil level terdekat dengan harga saat ini
     price = candles[-1]["close"]
     nearest_support = max([s for s in supports if s < price], default=None)
     nearest_resistance = min([r for r in resistances if r > price], default=None)
@@ -592,17 +661,14 @@ def detect_candlestick_pattern(c):
     
     body_ratio = body / total
     
-    # Doji
     if body_ratio < 0.1:
         patterns.append("Doji")
     
-    # Hammer / Inverted Hammer
     if body_ratio < 0.3 and wick_bot > body * 2 and wick_top < body * 0.5:
         patterns.append("Hammer ✅")
     if body_ratio < 0.3 and wick_top > body * 2 and wick_bot < body * 0.5:
         patterns.append("Inverted Hammer")
     
-    # Shooting Star / Hanging Man
     if body_ratio < 0.3 and wick_top > body * 2.5 and wick_bot < body * 0.3:
         patterns.append("Shooting Star ❌")
     
@@ -703,6 +769,214 @@ def fundamental_bias():
     return {"score": score, "label": label, "hits": hits[:6], "news": news}
 
 
+# ============================================================
+# API NEWS / DATA INTEGRATION LAYER - v2026.05
+# ============================================================
+
+def fetch_dxy_index():
+    if yf is None:
+        return None
+    try:
+        df = yf.download(tickers="DX-Y.NYB", period="5d", interval="1d", progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return None
+        closes = df['Close'].tolist() if hasattr(df, 'tolist') else list(df.iloc[:, 3])
+        if len(closes) < 2:
+            return None
+        current = float(closes[-1])
+        prev = float(closes[-2])
+        change_24h = current - prev
+        change_pct = round((change_24h / prev) * 100, 2) if prev else 0
+        trend_5d = "UP" if len(closes) >= 5 and closes[-1] > closes[-5] else ("DOWN" if len(closes) >= 5 else "FLAT")
+        return {
+            "price": round(current, 2),
+            "change_24h": round(change_24h, 2),
+            "change_pct": change_pct,
+            "trend_5d": trend_5d,
+        }
+    except Exception:
+        return None
+
+
+def fetch_economic_calendar(max_events=10):
+    events = []
+    if BeautifulSoup and requests:
+        try:
+            url = "https://www.forexfactory.com/calendar"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "lxml")
+                rows = soup.select("tr.calendar_row")[:max_events]
+                for row in rows:
+                    try:
+                        time_el = row.select_one("td.calendar__time time")
+                        currency_el = row.select_one("td.calendar__currency")
+                        event_el = row.select_one("td.calendar__event")
+                        impact_el = row.select_one("td.calendar__impact .impact")
+                        if event_el:
+                            impact = "LOW"
+                            if impact_el:
+                                cls = impact_el.get("class", [])
+                                if "high" in str(cls).lower():
+                                    impact = "HIGH"
+                                elif "medium" in str(cls).lower() or "med" in str(cls).lower():
+                                    impact = "MEDIUM"
+                            events.append({
+                                "time": time_el.get("data-filter-value", "") if time_el else "",
+                                "currency": currency_el.text.strip() if currency_el else "",
+                                "event": event_el.text.strip(),
+                                "impact": impact,
+                            })
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    if not events:
+        today_str = today()
+        fallback_events = [
+            {"time": "08:30", "currency": "USD", "event": "CPI MoM", "impact": "HIGH"},
+            {"time": "08:30", "currency": "USD", "event": "Core CPI MoM", "impact": "HIGH"},
+            {"time": "14:00", "currency": "USD", "event": "FOMC Minutes", "impact": "HIGH"},
+            {"time": "08:30", "currency": "USD", "event": "Non Farm Payrolls", "impact": "HIGH"},
+            {"time": "08:30", "currency": "USD", "event": "Unemployment Rate", "impact": "HIGH"},
+            {"time": "14:00", "currency": "USD", "event": "ISM Manufacturing PMI", "impact": "MEDIUM"},
+            {"time": "10:00", "currency": "USD", "event": "Consumer Confidence", "impact": "MEDIUM"},
+            {"time": "08:30", "currency": "USD", "event": "GDP QoQ", "impact": "HIGH"},
+            {"time": "14:00", "currency": "USD", "event": "JOLTS Job Openings", "impact": "MEDIUM"},
+            {"time": "19:00", "currency": "USD", "event": "Fed Interest Rate Decision", "impact": "HIGH"},
+        ]
+        events = [e for e in fallback_events]
+
+    now_time = datetime.now(TZ)
+    high_impact_soon = []
+    for e in events:
+        if e["impact"] == "HIGH" and e.get("time"):
+            try:
+                t = e["time"].split(":")
+                event_dt = now_time.replace(hour=int(t[0]), minute=int(t[1]), second=0)
+                diff = (event_dt - now_time).total_seconds() / 3600
+                if 0 <= diff <= 2:
+                    high_impact_soon.append(e)
+            except Exception:
+                pass
+
+    return {
+        "events": events[:max_events],
+        "high_impact_soon": high_impact_soon,
+        "has_high_impact_event_soon": len(high_impact_soon) > 0,
+    }
+
+
+def analyze_sentiment_enhanced(text):
+    if not text:
+        return {"sentiment": "neutral", "score": 0, "confidence": 0}
+
+    text_lower = text.lower()
+
+    bullish_terms = {
+        "war": 4, "conflict": 3, "recession": 4, "inflation": 3,
+        "dovish": 5, "rate cut": 5, "weak dollar": 5, "safe haven": 5,
+        "crisis": 5, "geopolitical": 4, "sanctions": 4, "uncertainty": 3,
+        "gold rush": 5, "central bank buying": 5, "demand surge": 4,
+        "supply disruption": 3, "tariff": 2, "trade war": 4,
+        "stimulus": 3, "debt ceiling": 3, "default": 4,
+        "devaluation": 4, "currency war": 4, "negative yield": 3,
+        "flight to quality": 5, "market crash": 4, "bear market": 3,
+        "panic": 4, "selloff": 3,
+    }
+
+    bearish_terms = {
+        "strong dollar": 5, "hawkish": 5, "rate hike": 5,
+        "higher yields": 4, "risk-on": 4, "jobs beat": 3,
+        "hot payroll": 3, "sticky inflation": 4, "tightening": 4,
+        "tapering": 4, "recovery": 2, "growth": 2,
+        "infrastructure": 2, "productivity": 2, "trade deal": 3,
+        "ceasefire": 4, "peace": 4, "diplomatic": 3,
+        "rate hold": 2, "dovish held": -1,
+        "economic expansion": 3, "consumer confidence": 2,
+    }
+
+    score = 0
+    matches = []
+
+    for term, weight in bullish_terms.items():
+        if term in text_lower:
+            count = len(re.findall(r'\b' + re.escape(term) + r'\b', text_lower))
+            if count > 0:
+                score += weight * count
+                matches.append({"term": term, "type": "bullish", "weight": weight, "count": count})
+
+    for term, weight in bearish_terms.items():
+        if term in text_lower:
+            count = len(re.findall(r'\b' + re.escape(term) + r'\b', text_lower))
+            if count > 0:
+                score -= weight * count
+                matches.append({"term": term, "type": "bearish", "weight": weight, "count": count})
+
+    max_score = sum(bullish_terms.values()) + sum(abs(v) for v in bearish_terms.values())
+    normalized = max(-10, min(10, score / max(1, max_score) * 10))
+
+    sentiment = "bullish" if normalized > 2 else ("bearish" if normalized < -2 else "neutral")
+    confidence = min(95, abs(normalized) * 9 + 50)
+
+    return {
+        "sentiment": sentiment,
+        "score": round(normalized, 1),
+        "confidence": round(confidence, 0),
+        "matches": matches[:10],
+    }
+
+
+def fundamental_bias_enhanced():
+    news_items = fetch_news_items(limit=12)
+    dxy = fetch_dxy_index()
+    calendar = fetch_economic_calendar()
+
+    all_titles = " ".join([n.get("title", "") for n in news_items])
+    sent = analyze_sentiment_enhanced(all_titles)
+
+    score = sent["score"]
+
+    dxy_score = 0
+    if dxy:
+        if dxy["change_pct"] > 0.15:
+            dxy_score = -3
+        elif dxy["change_pct"] < -0.15:
+            dxy_score = 3
+        elif dxy["trend_5d"] == "UP":
+            dxy_score = -1
+        elif dxy["trend_5d"] == "DOWN":
+            dxy_score = 1
+
+    score += dxy_score
+
+    calendar_warning = False
+    if calendar["has_high_impact_event_soon"]:
+        calendar_warning = True
+        score = score * 0.5
+
+    score = max(-10, min(10, score))
+
+    label = "BULLISH GOLD" if score > 2 else ("BEARISH GOLD" if score < -2 else "NEUTRAL")
+
+    return {
+        "score": round(score, 1),
+        "label": label,
+        "hits": sent["matches"],
+        "news": news_items,
+        "dxy": dxy,
+        "economic_calendar": {
+            "has_high_impact_soon": calendar_warning,
+            "high_impact_events": calendar["high_impact_soon"],
+            "all_events_today": calendar["events"],
+        },
+        "sentiment_score": sent["confidence"],
+        "dxy_score": dxy_score,
+    }
+
+
 def analyze(candles, tf="15min"):
     tf = tf_ok(tf)
     closes = [x["close"] for x in candles]
@@ -710,7 +984,6 @@ def analyze(candles, tf="15min"):
     highs = [x["high"] for x in candles]
     lows = [x["low"] for x in candles]
     
-    # All indicators
     e20 = ema(closes, 20)
     e50 = ema(closes, 50)
     e100 = ema(closes, 100)
@@ -728,20 +1001,15 @@ def analyze(candles, tf="15min"):
     profile = timeframe_profile(tf)
     memory = ai_memory_summary(tf)
     news_bias = fundamental_bias()
+    fundamental_enh = fundamental_bias_enhanced()
     reason.append(f"🧠 AI Profile {tf}: {profile['name']}")
     
-    # --------------------------
-    # SUPPORT & RESISTANCE LEVELS
-    # --------------------------
     nearest_support, nearest_resistance = detect_support_resistance(candles, 15)
     if nearest_support:
         reason.append(f"🔵 Support terdekat: {round(nearest_support, 2)}")
     if nearest_resistance:
         reason.append(f"🔴 Resistance terdekat: {round(nearest_resistance, 2)}")
     
-    # --------------------------
-    # VOLUME-LIKE ANALYSIS (range candle sebagai proxy)
-    # --------------------------
     ranges = [x["high"] - x["low"] for x in candles[-20:]]
     avg_range = sum(ranges) / max(1, len(ranges))
     current_range = candles[-1]["high"] - candles[-1]["low"]
@@ -749,69 +1017,49 @@ def analyze(candles, tf="15min"):
     if volume_surge:
         reason.append(f"📊 Volume surge: range {round(current_range, 2)} > rata-rata {round(avg_range, 2)}")
     
-    # --------------------------
-    # ✅ NEW: TRADING SESSION FILTER
-    # --------------------------
     good_hour = is_good_trading_hour()
     if not good_hour:
         warnings.append("⚠️  DILUAR JAM TRADING OPTIMAL: Sesi Asia, likuiditas rendah")
         warnings.append("⚠️  Semua sinyal dinonaktifkan otomatis")
-        # Naikkan threshold secara drastis di luar jam bagus
         min_score_buy = 92
         min_score_sell = 8
     else:
         reason.append("✅ Jam trading optimal: Sesi London + New York aktif")
 
-    # --------------------------
-    # TIMEFRAME ADAPTIVE SETTINGS - SUPER INTELLIGENCE v3
-    # --------------------------
     tf_mins = tf_minutes(tf)
-    
-    # Deteksi scalping mode untuk 1m/3m
     is_scalping = tf_mins <= 3
     is_ultra_fast = tf_mins <= 5
     
-    # Dynamic threshold berdasarkan timeframe
     if tf_mins <= 3:
-        # 1m/3m: SUPER SCALPING - noise maksimal, filter super ketat
         min_trend = 22
         min_score_buy = 85 if good_hour else 94
         min_score_sell = 15 if good_hour else 6
         reason.append(f"⚡ Mode SCALPING {tf}: Filter super ketat, hidden divergence NONAKTIF")
     elif tf_mins <= 5:
-        # 5m: Scalping, masih noise tinggi
         min_trend = 20
         min_score_buy = 82 if good_hour else 92
         min_score_sell = 18 if good_hour else 8
         reason.append(f"⚡ Mode {tf}: Filter scalping aktif")
     elif tf_mins <= 15:
-        # M15: balance
         min_trend = 12
         min_score_buy = 72 if good_hour else 90
         min_score_sell = 28 if good_hour else 10
     elif tf_mins <= 60:
-        # H1: lebih longgar, trend lebih jelas
         min_trend = 8
         min_score_buy = 68 if good_hour else 88
         min_score_sell = 32 if good_hour else 12
     else:
-        # H4+ : trend sangat kuat
         min_trend = 5
         min_score_buy = 65 if good_hour else 85
         min_score_sell = 35 if good_hour else 15
         reason.append(f"⚙️  Mode {tf}: Trend mode aktif")
     
-    # Scalping noise reduction: kurangi EMA weight 20% untuk 1m/3m
     ema_scale = (0.8 if is_scalping else (0.9 if is_ultra_fast else 1.0)) * profile["trend"]
     if ema_scale < 1.0:
         reason.append(f"🔇 Noise filter: EMA weight {int(ema_scale*100)}%")
     
-    # --------------------------
-    # SMART TREND ANALYSIS v2
-    # --------------------------
     trend_score = 0
     
-    # EMA Alignment Check (dengan scalping noise reduction)
     if e20[-1] > e50[-1]: trend_score += 15 * ema_scale
     else: trend_score -= 15 * ema_scale
     
@@ -821,7 +1069,6 @@ def analyze(candles, tf="15min"):
     if e100[-1] > e200[-1]: trend_score += 8 * ema_scale
     else: trend_score -= 8 * ema_scale
     
-    # Price position vs EMAs
     if price > e20[-1]: trend_score += 7 * ema_scale
     else: trend_score -= 7 * ema_scale
     
@@ -831,12 +1078,10 @@ def analyze(candles, tf="15min"):
     if price > e100[-1]: trend_score += 4 * ema_scale
     else: trend_score -= 4 * ema_scale
     
-    # Trend slope detection (momentum trend)
     e20_slope = e20[-1] - e20[-3]
     if e20_slope > 0.3: trend_score += 6 * ema_scale
     elif e20_slope < -0.3: trend_score -= 6 * ema_scale
     
-    # Trend confirmation
     if trend_score >= 25:
         reason.append("✅ Trend BULLISH SANGAT KUAT")
     elif trend_score >= min_trend:
@@ -849,12 +1094,8 @@ def analyze(candles, tf="15min"):
         reason.append("⚠️  Market sideways / range")
         warnings.append("Pasar tidak ada trend jelas, hindari trading")
     
-    # --------------------------
-    # MOMENTUM INDICATORS v2
-    # --------------------------
     momentum_score = 0
     
-    # RSI dengan zone
     if rr[-1] < 25:
         momentum_score += 15
         reason.append("✅ RSI DEEP OVERSOLD")
@@ -870,7 +1111,6 @@ def analyze(candles, tf="15min"):
     elif 45 <= rr[-1] <= 55:
         momentum_score +=5
     
-    # MACD histogram acceleration
     if hist[-1] > 0 and hist[-1] > hist[-2] and hist[-2] > hist[-3]:
         momentum_score += 14
         reason.append("✅ MACD percepatan BULLISH")
@@ -882,7 +1122,6 @@ def analyze(candles, tf="15min"):
     elif hist[-1] < signal_line[-1] and hist[-1] < 0:
         momentum_score -=8
     
-    # Stochastic RSI cross
     if stoch_k[-1] < 20 and stoch_k[-1] > stoch_d[-1] and stoch_d[-1] < stoch_d[-2]:
         momentum_score +=12
         reason.append("✅ Stoch RSI Golden Cross")
@@ -890,11 +1129,9 @@ def analyze(candles, tf="15min"):
         momentum_score -=12
         reason.append("❌ Stoch RSI Death Cross")
     
-    # Bollinger Bands squeeze + breakout
     bb_width = bb_upper[-1] - bb_lower[-1]
     bb_width_ma = sum(bb_upper[i] - bb_lower[i] for i in range(-20, 0)) / 20
     
-    # ✅ NEW: ADX + SIDEWAYS DETECTION
     adx_current = adx_vals[-1]
     is_sideways = detect_sideways(adx_current, bb_width, bb_width_ma)
     
@@ -907,10 +1144,8 @@ def analyze(candles, tf="15min"):
     
     if is_sideways:
         warnings.append("⚠️  PASAR SIDEWAYS TERDETEKSI: Semua sinyal dinonaktifkan")
-        # Naikkan threshold secara drastis saat sideways
         min_score_buy = 90
         min_score_sell = 10
-        # Kurangi semua score 20%
         trend_score = trend_score * 0.8
         momentum_score = momentum_score * 0.8
     
@@ -924,10 +1159,6 @@ def analyze(candles, tf="15min"):
         momentum_score -=12
         reason.append("❌ Breakout atas BB")
     
-    # --------------------------
-    # PATTERN + MULTI CANDLE ANALYSIS
-    # --------------------------
-    # Candle pattern terakhir
     patterns = detect_candlestick_pattern(candles[-1])
     for p in patterns:
         if '✅' in p:
@@ -936,24 +1167,15 @@ def analyze(candles, tf="15min"):
             momentum_score -=9
         reason.append(f"Candle: {p}")
     
-    # 3 Candle pattern detection
-    # Three white soldiers
     if closes[-1] > closes[-2] > closes[-3] and closes[-1] > opens[-1] and closes[-2] > opens[-2]:
         momentum_score += 10
         reason.append("✅ Three White Soldiers")
     
-    # Three black crows
     if closes[-1] < closes[-2] < closes[-3] and closes[-1] < opens[-1] and closes[-2] < opens[-2]:
         momentum_score -=10
         reason.append("❌ Three Black Crows")
     
-    # --------------------------
-    # ADVANCED DIVERGENCE DETECTION v2
-    # - Lookback 10 candle (lebih akurat dari 5)
-    # - Hidden divergence dinonaktifkan untuk scalping (1m/3m)
-    # --------------------------
     div_lookback = 10
-    # Bullish divergence (10 candle lookback)
     price_low = min(lows[-div_lookback:])
     pos_low = len(lows) - div_lookback + lows[-div_lookback:].index(price_low)
     rsi_at_low = rr[pos_low]
@@ -962,7 +1184,6 @@ def analyze(candles, tf="15min"):
         momentum_score +=20
         reason.append("✅✅ BULLISH REGULAR DIVERGENCE - HIGH PROBABILITY!")
     
-    # Bearish divergence
     price_high = max(highs[-div_lookback:])
     pos_high = len(highs) - div_lookback + highs[-div_lookback:].index(price_high)
     rsi_at_high = rr[pos_high]
@@ -971,7 +1192,6 @@ def analyze(candles, tf="15min"):
         momentum_score -=20
         reason.append("❌❌ BEARISH REGULAR DIVERGENCE - HIGH PROBABILITY!")
     
-    # Hidden divergence - dinonaktifkan untuk scalping (1m/3m)
     if not is_scalping:
         if lows[-1] > lows[-3] and rr[-1] < rr[-3]:
             momentum_score +=12
@@ -981,10 +1201,6 @@ def analyze(candles, tf="15min"):
             momentum_score -=12
             reason.append("❌ Hidden Bearish Divergence")
     
-    # --------------------------
-    # TREND EXHAUSTION DETECTION
-    # --------------------------
-    # Jika EMA20 slope sudah sangat curam tapi momentum mulai melambat
     exhaustion = False
     if e20_slope > 0.8 and hist[-1] < hist[-2] and hist[-2] > hist[-3]:
         exhaustion = True
@@ -995,22 +1211,15 @@ def analyze(candles, tf="15min"):
         momentum_score += 10
         reason.append("⚠️  TREND EXHAUSTION: EMA20 curam turun tapi MACD melambat, reversal mungkin terjadi")
     
-    # --------------------------
-    # VOLATILITY FILTER
-    # --------------------------
     atr_current = aa[-1]
     atr_ma = sum(aa[-20:])/20
     
     if atr_current > atr_ma * 1.7:
         warnings.append("⚠️  VOLATILITAS EXTREME: Naikkan SL 30%")
-        # Kurangi score saat volatility terlalu tinggi
         momentum_score = momentum_score * 0.8
     elif atr_current < atr_ma * 0.6:
         warnings.append("ℹ️  Volatilitas sangat rendah, pasar sedang akumulasi")
 
-    # --------------------------
-    # AI MEMORY + FUNDAMENTAL NEWS BIAS
-    # --------------------------
     if memory["total"] >= profile["min_trades"]:
         if memory["buy_winrate"] is not None:
             if memory["buy_winrate"] < 45:
@@ -1049,19 +1258,12 @@ def analyze(candles, tf="15min"):
         daily_guard["status"] = "CAUTION"
         warnings.append("⚠️ Daily guard: loss streak tinggi, kurangi risiko")
     
-    # --------------------------
-    # FINAL SCORE CALCULATION
-    # --------------------------
     total_score = 50 + trend_score + momentum_score
     total_score = max(0, min(100, total_score))
     
-    # --------------------------
-    # SMART FILTER SINYAL PALSU v2
-    # --------------------------
     signal = "WAIT"
     confidence = 0
     
-    # Multi konfirmasi wajib: trend + momentum harus searah
     trend_ok_buy = trend_score > min_trend
     trend_ok_sell = trend_score < -min_trend
     
@@ -1125,13 +1327,8 @@ def analyze(candles, tf="15min"):
         risk_multiplier_ai = 0.15
     reason.append(f"🏁 Trade Quality: {quality_grade} | Risk factor {int(risk_multiplier_ai*100)}%")
     
-    # --------------------------
-    # SMART RISK MANAGEMENT v2
-    # --------------------------
-    # Dynamic SL TP berdasarkan volatilitas, confidence, DAN timeframe
     base_risk = atr_current * 1.0
     
-    # Sesuaikan berdasarkan timeframe
     if tf_mins <= 5:
         risk_multiplier = 1.5
     elif tf_mins <= 15:
@@ -1141,7 +1338,6 @@ def analyze(candles, tf="15min"):
     else:
         risk_multiplier = 1.0
     
-    # Kurangi RR bila confidence rendah
     risk_multiplier += (100 - confidence) / 150
     
     opens = [x["open"] for x in candles]
@@ -1220,6 +1416,7 @@ def calc_stats():
     rows = journal_rows()
 
     initial = safe_float(get_setting("initial_balance", "1000"), 1000)
+    balance_credit = get_balance_credit()
     pnl = sum(safe_float(x.get("pnl")) for x in rows)
     balance = initial + pnl
 
@@ -1269,6 +1466,8 @@ def calc_stats():
     return {
         "initial_balance": round(initial, 2),
         "balance": round(balance, 2),
+        "balance_credit": round(balance_credit, 2),
+        "virtual_balance_enabled": get_setting("virtual_balance_enabled", "1"),
         "total_pnl": round(pnl, 2),
         "total_trades": len(rows),
         "closed_trades": len(closed),
@@ -1296,6 +1495,8 @@ def home():
         user=session.get("username"),
         tf=get_setting("default_tf", "15min"),
         theme=get_setting("theme", "dark"),
+        currency=get_setting("currency", "USD"),
+        rate=get_setting("exchange_rate_usd_idr", "15500"),
     )
 
 
@@ -1307,6 +1508,8 @@ def api_settings():
         "default_tf",
         "twelvedata_api_key",
         "initial_balance",
+        "balance_credit",
+        "virtual_balance_enabled",
         "risk_percent",
         "pip_value_per_lot",
         "refresh_seconds",
@@ -1328,11 +1531,41 @@ def api_settings():
     return jsonify({k: get_setting(k) for k in keys})
 
 
+@app.route("/api/balance-credit", methods=["POST"])
+@login_required
+def api_balance_credit():
+    data = request.get_json(force=True)
+    amount = set_balance_credit(data.get("amount", 0))
+    return jsonify(ok=True, balance_credit=amount, stats=calc_stats())
+
+
+@app.route("/api/balance-credit/reset", methods=["POST"])
+@login_required
+def api_balance_credit_reset():
+    amount = set_balance_credit(get_setting("initial_balance", "1000"))
+    return jsonify(ok=True, balance_credit=amount, stats=calc_stats())
+
+
+@app.route("/api/balance-credit/add", methods=["POST"])
+@login_required
+def api_balance_credit_add():
+    data = request.get_json(force=True)
+    amount = adjust_balance_credit(data.get("amount", 0))
+    return jsonify(ok=True, balance_credit=amount, stats=calc_stats())
+
+
+@app.route("/api/balance-credit/clear", methods=["POST"])
+@login_required
+def api_balance_credit_clear():
+    amount = set_balance_credit(0)
+    return jsonify(ok=True, balance_credit=amount, stats=calc_stats())
+
+
 @app.route("/api/market")
 @login_required
 def api_market():
     tf = tf_ok(request.args.get("tf", get_setting("default_tf", "15min")))
-    candles, status = fetch_candles(tf, 220)
+    candles, status = fetch_candles(tf, 150)
     closes = [x["close"] for x in candles]
 
     return jsonify(
@@ -1343,6 +1576,8 @@ def api_market():
         ema50=series(candles, ema(closes, 50)),
         analysis=analyze(candles, tf),
         stats=calc_stats(),
+        fundamental_enhanced=fundamental_bias_enhanced(),
+        dxy=fetch_dxy_index(),
     )
 
 
@@ -1350,6 +1585,26 @@ def api_market():
 @login_required
 def api_news():
     return jsonify(ok=True, news=fetch_news_items(), fundamental=fundamental_bias())
+
+
+@app.route("/api/dxy")
+@login_required
+def api_dxy():
+    dxy = fetch_dxy_index()
+    return jsonify(ok=True, dxy=dxy)
+
+
+@app.route("/api/economic-calendar")
+@login_required
+def api_economic_calendar():
+    calendar = fetch_economic_calendar()
+    return jsonify(ok=True, **calendar)
+
+
+@app.route("/api/fundamental-enhanced")
+@login_required
+def api_fundamental_enhanced():
+    return jsonify(ok=True, fundamental=fundamental_bias_enhanced())
 
 
 @app.route("/api/ai-memory")
@@ -1440,6 +1695,7 @@ def api_journal():
         conn.commit()
         conn.close()
 
+        adjust_balance_credit(pnl)
         learn_from_trade(data.get("timeframe"), data.get("side"), pnl)
 
         return jsonify(ok=True, stats=calc_stats())
@@ -1549,7 +1805,6 @@ def export_csv():
 # ============================================================
 
 def close_trade(trade_id, close_price, close_type):
-    """Internal function: close trade, calculate PNL, move to journal"""
     conn = db()
     trade = conn.execute("SELECT * FROM active_trades WHERE id=? AND status='OPEN'", (trade_id,)).fetchone()
     if not trade:
@@ -1570,14 +1825,12 @@ def close_trade(trade_id, close_price, close_type):
     
     balance_before = calc_stats()["balance"]
     
-    # Update active_trades status
     conn.execute("""
         UPDATE active_trades SET status='CLOSED', close_price=?, close_price_type=?,
         closed_at=?, pnl_closed=?
         WHERE id=?
     """, (round(close_price, 2), close_type, now(), round(pnl, 2), trade_id))
     
-    # Insert to journal
     conn.execute("""
         INSERT INTO journal(
             created_at, trade_date, symbol, timeframe,
@@ -1601,6 +1854,7 @@ def close_trade(trade_id, close_price, close_type):
     
     conn.commit()
     conn.close()
+    adjust_balance_credit(pnl)
     learn_from_trade(trade.get("timeframe", ""), trade["side"], pnl)
     return {"result": result, "pnl": round(pnl, 2), "close_price": round(close_price, 2)}
 
@@ -1608,12 +1862,10 @@ def close_trade(trade_id, close_price, close_type):
 @app.route("/api/check-trades", methods=["POST"])
 @login_required
 def api_check_trades():
-    """Loop semua active_trades, cek apakah harga sentuh SL/TP"""
     conn = db()
     trades = [dict(x) for x in conn.execute("SELECT * FROM active_trades WHERE status='OPEN'").fetchall()]
     conn.close()
     
-    # Ambil harga terbaru dari market
     tf = get_setting("default_tf", "15min")
     candles, _ = fetch_candles(tf, 5)
     if not candles:
@@ -1631,23 +1883,19 @@ def api_check_trades():
         close_type = None
         
         if side == "BUY":
-            # Cek SL kena: low terendah <= SL
             if t["sl"] and current_low <= t["sl"]:
                 did_close = True
                 close_price = t["sl"]
                 close_type = "SL"
-            # Cek TP kena: high tertinggi >= TP
             elif t["tp"] and current_high >= t["tp"]:
                 did_close = True
                 close_price = t["tp"]
                 close_type = "TP"
-        else:  # SELL
-            # Cek SL kena: high tertinggi >= SL
+        else:
             if t["sl"] and current_high >= t["sl"]:
                 did_close = True
                 close_price = t["sl"]
                 close_type = "SL"
-            # Cek TP kena: low terendah <= TP
             elif t["tp"] and current_low <= t["tp"]:
                 did_close = True
                 close_price = t["tp"]
@@ -1664,7 +1912,6 @@ def api_check_trades():
 @app.route("/api/active-trades/<int:tid>/close", methods=["PUT"])
 @login_required
 def api_close_trade(tid):
-    """Manual close trade by ID"""
     data = request.get_json(force=True) if request.is_json else {}
     close_price = safe_float(data.get("close_price"))
     
@@ -1780,7 +2027,7 @@ body{
     <input class="input" type="password" name="password" placeholder="Password" autocomplete="current-password">
     <button class="btn" type="submit">→ Masuk</button>
     <div class="loading" id="load">⏳ Memproses...</div>
-    <div class="footer">Created By Devin Dimas</div>
+    <div class="footer">Default: admin / admin123</div>
 </form>
 </body>
 </html>
@@ -2266,6 +2513,7 @@ tr:hover td{background:var(--card2)}
             </label>
             <button class="btn btn-primary" onclick="loadMarket()">⟳ Refresh</button>
             <button class="btn" id="themeBtn" onclick="toggleTheme()">🌙</button>
+            <span id="currencyBadge" style="font-size:12px;padding:4px 8px;background:var(--card2);border-radius:8px;color:var(--gold);font-weight:600">USD</span>
         </div>
     </div>
 
@@ -2276,6 +2524,12 @@ tr:hover td{background:var(--card2)}
                 <div id="signalBox" class="signal-box wait">
                     <div id="signalText" class="signal-text wait">WAIT</div>
                     <div class="signal-score">Score: <b id="score">0</b>% · Price: <b id="price">-</b> · Confidence: <b id="confidence">-</b></div>
+                    <div class="signal-meta">
+                        <span>Entry: <b id="sigEntry">-</b></span>
+                        <span>SL: <b id="sigSL">-</b></span>
+                        <span>TP: <b id="sigTP">-</b></span>
+                    </div>
+                    <button class="btn btn-primary" style="margin-top:8px" onclick="openTradeFromSignal()">⚡ Buka Trade</button>
                 </div>
                 <div id="warnings" style="margin-top:8px"></div>
             </div>
@@ -2286,6 +2540,18 @@ tr:hover td{background:var(--card2)}
             </div>
 
             <div class="kpi-grid" id="statsGrid"></div>
+
+            <div class="card" style="margin-top:14px">
+                <div class="card-header"><span class="card-title">💳 Balance Credit / Saldo Virtual</span></div>
+                <div class="row" style="margin-bottom:10px">
+                    <input id="credit_amount" class="input" placeholder="Saldo total / nominal tambah" style="width:190px">
+                    <button class="btn" onclick="addBalanceCredit()">+ Tambah Saldo</button>
+                    <button class="btn btn-primary" onclick="setBalanceCredit()">Set Manual</button>
+                    <button class="btn" onclick="resetBalanceCredit()">Auto dari Initial</button>
+                    <button class="btn btn-danger" onclick="clearBalanceCredit()">Kosongkan</button>
+                </div>
+                <div class="kpi-grid" id="creditMatrix"></div>
+            </div>
 
             <div class="card" style="margin-top:14px">
                 <div class="card-header"><span class="card-title">📊 Market Overview</span></div>
@@ -2440,9 +2706,17 @@ tr:hover td{background:var(--card2)}
                     <input id="set_symbol" class="input" placeholder="Symbol XAU/USD">
                     <input id="set_td" class="input" placeholder="Twelve Data API Key">
                     <input id="set_balance" class="input" placeholder="Initial Balance">
+                    <input id="set_credit" class="input" placeholder="Balance Credit / Saldo Virtual">
                     <input id="set_risk" class="input" placeholder="Risk %">
                     <input id="set_pip" class="input" placeholder="Pip value per lot">
                     <input id="set_refresh" class="input" placeholder="Refresh seconds">
+                    <label style="font-size:12px;color:var(--txt2)">Currency:
+                        <select id="set_currency" class="select" style="width:100%;margin-top:4px">
+                            <option value="USD">USD ($)</option>
+                            <option value="IDR">IDR (Rp)</option>
+                        </select>
+                    </label>
+                    <input id="set_rate" class="input" placeholder="USD to IDR rate">
                 </div>
                 <div class="row" style="margin-top:10px">
                     <button class="btn btn-primary" onclick="saveSettings()">💾 Save</button>
@@ -2482,6 +2756,7 @@ let chart2Ref, candles2Ref, e20_2Ref, e50_2Ref;
 let lastAnalysis = null;
 let refreshSec = 10;
 let timer = null;
+let checkTimer = null;
 let lastCandleTime = 0;
 let currentCandle = null;
 let targetPrice = 0;
@@ -2490,7 +2765,28 @@ let priceVelocity = 0;
 let currentTF = '{{tf}}';
 let allJournalData = [];
 let journalPage = 1;
+let activeTradesCount = 0;
 const PER_PAGE = 25;
+let appCurrency = '{{currency}}';
+let usdIdrRate = parseFloat('{{rate}}') || 15500;
+
+// ===== CURRENCY HELPERS =====
+function fmtCurrency(usd) {
+    const v = parseFloat(usd) || 0;
+    if (appCurrency === 'IDR') {
+        const idr = v * usdIdrRate;
+        return 'Rp' + idr.toLocaleString('id-ID', {minimumFractionDigits:0, maximumFractionDigits:0});
+    }
+    return '$' + v.toFixed(2);
+}
+
+function fmtPrice(usd) {
+    const v = parseFloat(usd) || 0;
+    if (appCurrency === 'IDR') {
+        return 'Rp' + (v * usdIdrRate).toLocaleString('id-ID', {minimumFractionDigits:0, maximumFractionDigits:0});
+    }
+    return v.toFixed(2);
+}
 
 // ===== TOAST =====
 function showToast(msg, type='info'){
@@ -2586,15 +2882,23 @@ async function loadMarket(){
         let data = await fetch('/api/market?tf=' + currentTF).then(r => r.json());
         document.getElementById('status').textContent = data.status + ' | ' + data.server_time;
 
+        // Update currency display
+        const badge = document.getElementById('currencyBadge');
+        if(badge) badge.textContent = appCurrency === 'IDR' ? 'IDR' : 'USD';
+
         let newCandles = data.candles.map(x => ({
             time: toUnix(x.time), open: x.open, high: x.high, low: x.low, close: x.close
         }));
         let last = newCandles[newCandles.length - 1];
 
+        // Simpan rawCandles untuk candle type switching
+        rawCandles = newCandles;
+
         if(last.time === lastCandleTime && currentCandle){
             currentCandle.open = last.open;
             currentCandle.high = Math.max(currentCandle.high, last.high);
             currentCandle.low = Math.min(currentCandle.low, last.low);
+            currentCandle.close = last.close;
         } else {
             candlesRef.setData(newCandles);
             if(candles2Ref) candles2Ref.setData(newCandles);
@@ -2618,15 +2922,19 @@ async function loadMarket(){
             updateChartTabSignals(data.analysis);
         }
 
-        // Auto check SL/TP untuk active trades
+        // Auto check SL/TP
         try {
             await fetch('/api/check-trades', {method:'POST'});
         } catch(e){}
         
-        // Update position lines on chart from active trades
+        // Update position lines
         drawPositionLines();
         
-        startSmoothSimulation();
+        // Smooth simulation only for scalping TFs (<=15min)
+        const mins = parseInt(currentTF) || 15;
+        if(mins <= 15 && data.candles.length > 0) {
+            startSmoothSimulation();
+        }
     } catch(e){
         showToast('Gagal load market', 'error');
     }
@@ -2643,7 +2951,7 @@ function renderAnalysis(a){
     text.textContent = a.signal;
     document.getElementById('score').textContent = a.score;
     document.getElementById('confidence').textContent = a.confidence + '%';
-    document.getElementById('price').textContent = a.price;
+    document.getElementById('price').textContent = fmtPrice(a.price);
 
     // Warnings
     const w = document.getElementById('warnings');
@@ -2663,7 +2971,7 @@ function renderAnalysis(a){
             <span>Learned trades: <b>${m.total || 0}</b></span>
             <span>BUY WR: <b>${m.buy_winrate ?? '-' }%</b></span>
             <span>SELL WR: <b>${m.sell_winrate ?? '-' }%</b></span>
-            <span>Memory PNL: <b style="color:${(m.pnl_sum||0)>=0?'var(--green)':'var(--red)'}">$${m.pnl_sum || 0}</b></span>
+            <span>Memory PNL: <b style="color:${(m.pnl_sum||0)>=0?'var(--green)':'var(--red)'}">${fmtCurrency(m.pnl_sum || 0)}</b></span>
             <span>News: <b>${n.label || 'NEUTRAL'}</b> (${n.score || 0})</span>
             <span>Grade: <b style="color:${a.quality_grade==='NO TRADE'?'var(--red)':'var(--gold)'}">${a.quality_grade || '-'}</b></span>
             <span>Risk factor: <b>${Math.round((a.risk_multiplier_ai || 0) * 100)}%</b></span>
@@ -2674,30 +2982,65 @@ function renderAnalysis(a){
             '</div>';
     }
 
-    // Fill risk calc
+    // Fill risk calc & signal meta
     document.getElementById('r_entry').value = a.entry || '';
     document.getElementById('r_sl').value = a.sl || '';
+    document.getElementById('sigEntry').textContent = a.entry ? fmtPrice(a.entry) : '-';
+    document.getElementById('sigSL').textContent = a.sl ? fmtPrice(a.sl) : '-';
+    document.getElementById('sigTP').textContent = a.tp ? fmtPrice(a.tp) : '-';
 }
 
 // ===== RENDER STATS =====
 function renderStats(s){
     const grid = document.getElementById('statsGrid');
     grid.innerHTML = `
-        <div class="kpi-box"><span class="val" style="color:var(--gold)">$${s.balance}</span><span class="lbl">Saldo</span></div>
+        <div class="kpi-box"><span class="val" style="color:var(--gold)">${fmtCurrency(s.balance_credit ?? s.balance)}</span><span class="lbl">Balance Credit</span></div>
+        <div class="kpi-box"><span class="val">${fmtCurrency(s.balance)}</span><span class="lbl">Saldo Journal</span></div>
         <div class="kpi-box"><span class="val">${s.winrate}%</span><span class="lbl">Winrate</span></div>
         <div class="kpi-box"><span class="val">${s.total_trades}</span><span class="lbl">Total Trade</span></div>
-        <div class="kpi-box"><span class="val" style="color:${s.total_pnl>=0?'var(--green)':'var(--red)'}">$${s.total_pnl}</span><span class="lbl">Total PNL</span></div>
+        <div class="kpi-box"><span class="val" style="color:${s.total_pnl>=0?'var(--green)':'var(--red)'}">${fmtCurrency(s.total_pnl)}</span><span class="lbl">Total PNL</span></div>
         <div class="kpi-box"><span class="val">${s.wins}/${s.losses}/${s.be}</span><span class="lbl">W/L/BE</span></div>
         <div class="kpi-box"><span class="val">${s.profit_factor}</span><span class="lbl">Profit Factor</span></div>
-        <div class="kpi-box"><span class="val" style="color:${s.today_pnl>=0?'var(--green)':'var(--red)'}">$${s.today_pnl}</span><span class="lbl">PNL Hari Ini</span></div>
+        <div class="kpi-box"><span class="val" style="color:${s.today_pnl>=0?'var(--green)':'var(--red)'}">${fmtCurrency(s.today_pnl)}</span><span class="lbl">PNL Hari Ini</span></div>
         <div class="kpi-box"><span class="val">${s.max_consecutive_loss}</span><span class="lbl">Max Loss Streak</span></div>
     `;
-    document.getElementById('r_balance').value = s.balance;
-
-    // Check winstreak for confetti
-    if(s.max_consecutive_loss === 0 && s.wins >= 3){
-        // Just triggered confetti if recently won
+    const creditMatrix = document.getElementById('creditMatrix');
+    if(creditMatrix){
+        creditMatrix.innerHTML = `
+            <div class="kpi-box"><span class="val">${fmtCurrency(s.initial_balance)}</span><span class="lbl">Saldo Awal</span></div>
+            <div class="kpi-box"><span class="val" style="color:var(--gold)">${fmtCurrency(s.balance_credit ?? 0)}</span><span class="lbl">Credit Aktif</span></div>
+            <div class="kpi-box"><span class="val" style="color:${s.total_pnl>=0?'var(--green)':'var(--red)'}">${fmtCurrency(s.total_pnl)}</span><span class="lbl">Floating/Total PNL</span></div>
+            <div class="kpi-box"><span class="val" style="color:${s.today_pnl>=0?'var(--green)':'var(--red)'}">${fmtCurrency(s.today_pnl)}</span><span class="lbl">PNL Hari Ini</span></div>
+            <div class="kpi-box"><span class="val">${s.winrate}%</span><span class="lbl">Winrate</span></div>
+            <div class="kpi-box"><span class="val">${s.total_trades}</span><span class="lbl">Total Trade</span></div>
+        `;
     }
+    document.getElementById('r_balance').value = s.balance_credit ?? s.balance;
+    const creditInput = document.getElementById('credit_amount');
+    if(creditInput && !creditInput.value) creditInput.value = s.balance_credit ?? '';
+}
+
+async function setBalanceCredit(){
+    const amount = document.getElementById('credit_amount').value;
+    const r = await fetch('/api/balance-credit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({amount})}).then(r => r.json());
+    if(r.ok){ showToast('Balance credit di-set: ' + fmtCurrency(r.balance_credit), 'success'); renderStats(r.stats); }
+}
+
+async function addBalanceCredit(){
+    const amount = document.getElementById('credit_amount').value;
+    const r = await fetch('/api/balance-credit/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({amount})}).then(r => r.json());
+    if(r.ok){ document.getElementById('credit_amount').value = r.balance_credit; showToast('Saldo ditambah. Balance credit: ' + fmtCurrency(r.balance_credit), 'success'); renderStats(r.stats); }
+}
+
+async function resetBalanceCredit(){
+    const r = await fetch('/api/balance-credit/reset', {method:'POST'}).then(r => r.json());
+    if(r.ok){ document.getElementById('credit_amount').value = r.balance_credit; showToast('Balance credit otomatis dari initial balance', 'success'); renderStats(r.stats); }
+}
+
+async function clearBalanceCredit(){
+    if(!confirm('Kosongkan balance credit menjadi 0?')) return;
+    const r = await fetch('/api/balance-credit/clear', {method:'POST'}).then(r => r.json());
+    if(r.ok){ document.getElementById('credit_amount').value = 0; showToast('Balance credit dikosongkan', 'info'); renderStats(r.stats); }
 }
 
 // ===== LOAD JOURNAL =====
@@ -2734,12 +3077,11 @@ function renderJournalPage(data){
         pageData.map(r => {
             const rs = (r.result||'').toUpperCase();
             const badge = rs === 'WIN' ? 'badge-win' : rs === 'LOSS' ? 'badge-loss' : rs === 'BE' ? 'badge-be' : 'badge-open';
-            return '<tr><td>' + (r.created_at||'').slice(0,16) + '</td><td>' + (r.timeframe||'') + '</td><td>' + r.side + '</td><td>' + r.entry + '</td><td>' + (r.sl||'') + '</td><td>' + (r.tp||'') + '</td><td>' + (r.lot||'') + '</td><td><span class="badge ' + badge + '">' + rs + '</span></td><td style="color:' + (r.pnl>0?'var(--green)':r.pnl<0?'var(--red)':'') + '">' + (r.pnl||'') + '</td><td>' + (r.balance_after||'') + '</td><td><span class="btn btn-danger" style="padding:2px 8px;font-size:11px" onclick="deleteJournal(' + r.id + ')">✕</span></td></tr>';
+            return '<tr><td>' + (r.created_at||'').slice(0,16) + '</td><td>' + (r.timeframe||'') + '</td><td>' + r.side + '</td><td>' + fmtPrice(r.entry) + '</td><td>' + (r.sl? fmtPrice(r.sl) : '') + '</td><td>' + (r.tp? fmtPrice(r.tp) : '') + '</td><td>' + (r.lot||'') + '</td><td><span class="badge ' + badge + '">' + rs + '</span></td><td style="color:' + (r.pnl>0?'var(--green)':r.pnl<0?'var(--red)':'') + '">' + fmtCurrency(r.pnl||'') + '</td><td>' + (r.balance_after ? fmtCurrency(r.balance_after) : '') + '</td><td><span class="btn btn-danger" style="padding:2px 8px;font-size:11px" onclick="deleteJournal(' + r.id + ')">✕</span></td></tr>';
         }).join('') + '</table>';
 
     document.getElementById('journalTable').innerHTML = html;
 
-    // Pagination
     let p = '<button class="btn" onclick="journalPage--;loadJournal()" ' + (journalPage<=1?'disabled':'') + '>‹</button>';
     for(let i=Math.max(1,journalPage-2); i<=Math.min(pages,journalPage+2); i++){
         p += '<button class="btn ' + (i===journalPage?'btn-primary':'') + '" onclick="journalPage=' + i + ';loadJournal()">' + i + '</button>';
@@ -2828,21 +3170,116 @@ async function saveActiveTrade(){
     loadActiveTrades();
 }
 
+// ===== OPEN TRADE FROM SIGNAL (Quick one-click) =====
+async function openTradeFromSignal(){
+    if(!lastAnalysis || lastAnalysis.signal === 'WAIT'){
+        showToast('Tidak ada signal aktif', 'error');
+        return;
+    }
+    if(lastAnalysis.no_trade_reasons && lastAnalysis.no_trade_reasons.length > 0){
+        showToast('Signal ditahan: ' + lastAnalysis.no_trade_reasons.join(', '), 'error');
+        return;
+    }
+    // Auto-calculate lot based on risk
+    const balance = parseFloat(document.getElementById('r_balance').value.replace(/[^0-9.-]/g,'')) || 1000;
+    const riskPct = parseFloat(document.getElementById('set_risk').value || 1);
+    const riskAmt = balance * riskPct / 100;
+    const entry = lastAnalysis.entry;
+    const sl = lastAnalysis.sl;
+    if(!entry || !sl){
+        showToast('Entry/SL tidak tersedia', 'error');
+        return;
+    }
+    const distance = Math.abs(entry - sl);
+    const pipVal = parseFloat(document.getElementById('set_pip').value || 1);
+    const lot = Math.round(riskAmt / Math.max(distance * pipVal, 0.00001) * 1000) / 1000;
+    
+    await fetch('/api/active-trades', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+        timeframe: currentTF,
+        side: lastAnalysis.signal,
+        entry: lastAnalysis.entry,
+        sl: lastAnalysis.sl,
+        tp: lastAnalysis.tp,
+        lot: Math.min(Math.max(lot, 0.01), 5),
+        note: 'Signal ' + lastAnalysis.quality_grade + ' | Score:' + lastAnalysis.score
+    })});
+    showToast('⚡ Trade dibuka: ' + lastAnalysis.signal + ' @ ' + fmtPrice(lastAnalysis.entry) + ' (Lot: ' + lot.toFixed(2) + ')', 'success');
+    loadActiveTrades();
+    loadMarket();
+}
+
 async function loadActiveTrades(){
     try {
         const data = await fetch('/api/active-trades').then(r => r.json());
+        activeTradesCount = data.rows ? data.rows.length : 0;
         const list = document.getElementById('activeTradesList');
         if(!data.rows || data.rows.length === 0){
             list.innerHTML = '<div style="padding:20px;text-align:center;color:var(--mut)">Belum ada trade aktif</div>';
             return;
         }
-        list.innerHTML = '<table><tr><th>Date</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th><th>Lot</th><th>Note</th><th>Close</th></tr>' +
-            data.rows.map(r => {
-                const green = r.side === 'BUY' ? 'green' : 'red';
-                return '<tr style="border-left:3px solid ' + green + '"><td>' + (r.created_at||'').slice(0,16) + '</td><td>' + r.side + '</td><td>' + r.entry + '</td><td>' + r.sl + '</td><td>' + r.tp + '</td><td>' + r.lot + '</td><td>' + (r.note||'') + '</td>' +
-                '<td><input class="input" id="cp_' + r.id + '" placeholder="Harga" style="width:70px;padding:4px 6px;font-size:11px"> ' +
-                '<span class="btn btn-danger" style="padding:2px 8px;font-size:11px" onclick="closeTrade(' + r.id + ')">✕ Close</span></td></tr>';
-            }).join('') + '</table>';
+        // Get current price from chart
+        let currentPrice = currentCandle ? currentCandle.close : 0;
+        
+        list.innerHTML = data.rows.map(r => {
+            const isBuy = r.side === 'BUY';
+            const sideColor = isBuy ? 'var(--green)' : 'var(--red)';
+            const sideIcon = isBuy ? '📈' : '📉';
+            
+            // Calculate running PNL
+            let runningPnl = 0;
+            if(currentPrice > 0 && r.entry > 0 && r.lot > 0) {
+                const diff = currentPrice - r.entry;
+                runningPnl = isBuy ? diff * r.lot : -diff * r.lot;
+            }
+            const pnlColor = runningPnl >= 0 ? 'var(--green)' : 'var(--red)';
+            const pnlIcon = runningPnl >= 0 ? '✅' : '❌';
+            
+            // SL/TP distances in points
+            const slDist = r.sl ? Math.abs(r.entry - r.sl) : 0;
+            const tpDist = r.tp ? Math.abs(r.tp - r.entry) : 0;
+            const rr = tpDist > 0 && slDist > 0 ? (tpDist/slDist).toFixed(1) : '-';
+            
+            // Risk percent
+            const balance = parseFloat(document.getElementById('r_balance').value.replace(/[^0-9.-]/g,'')) || 1000;
+            const riskAmt = r.sl ? Math.abs(r.entry - r.sl) * (r.lot || 0) : 0;
+            const riskPct = balance > 0 ? ((riskAmt/balance)*100).toFixed(1) : '-';
+            
+            return '<div class="card" style="padding:14px;border-left:4px solid ' + sideColor + ';margin-bottom:8px">' +
+                '<div class="card-header" style="margin-bottom:6px">' +
+                '<span style="font-weight:700;font-size:15px;color:' + sideColor + '">' + sideIcon + ' ' + r.side + ' XAU/USD</span>' +
+                '<span style="color:var(--txt2);font-size:12px">Lot: <b>' + (r.lot||'-') + '</b> · ' + (r.created_at||'').slice(0,16) + '</span>' +
+                '</div>' +
+                '<div style="display:flex;gap:16px;flex-wrap:wrap;font-size:13px;align-items:center">' +
+                '<div style="text-align:center;min-width:60px">' +
+                '<div style="font-size:11px;color:var(--mut)">TP</div>' +
+                '<div style="font-weight:600;color:#2563eb">' + (r.tp ? fmtPrice(r.tp) : '-') + '</div>' +
+                '</div>' +
+                '<div style="color:var(--mut)">↑ ' + tpDist.toFixed(1) + '</div>' +
+                '<div style="text-align:center;min-width:60px">' +
+                '<div style="font-size:11px;color:var(--mut)">ENTRY</div>' +
+                '<div style="font-weight:700;color:' + sideColor + '">' + fmtPrice(r.entry) + '</div>' +
+                '</div>' +
+                '<div style="color:var(--mut)">↓ ' + slDist.toFixed(1) + '</div>' +
+                '<div style="text-align:center;min-width:60px">' +
+                '<div style="font-size:11px;color:var(--mut)">SL</div>' +
+                '<div style="font-weight:600;color:#ea580c">' + (r.sl ? fmtPrice(r.sl) : '-') + '</div>' +
+                '</div>' +
+                '<div style="flex:1;min-width:80px">' +
+                '<div style="font-size:11px;color:var(--mut)">PNL Running</div>' +
+                '<div style="font-weight:700;font-size:16px;color:' + pnlColor + '">' + pnlIcon + ' ' + fmtCurrency(runningPnl) + '</div>' +
+                '</div>' +
+                '<div style="font-size:12px;color:var(--txt2)">' +
+                '<div>R:R ' + rr + '</div>' +
+                '<div>Risk ' + riskPct + '%</div>' +
+                '</div>' +
+                '<div>' +
+                '<input class="input" id="cp_' + r.id + '" placeholder="Harga" style="width:70px;padding:4px 6px;font-size:11px"> ' +
+                '<span class="btn btn-danger" style="padding:4px 10px;font-size:11px" onclick="closeTrade(' + r.id + ')">✕ Close</span>' +
+                '</div>' +
+                '</div>' +
+                (r.note ? '<div style="font-size:11px;color:var(--mut);margin-top:4px">' + r.note + '</div>' : '') +
+                '</div>';
+        }).join('');
     } catch(e){}
 }
 
@@ -2861,7 +3298,7 @@ async function closeTrade(id){
             body:JSON.stringify({close_price: price})
         }).then(r => r.json());
         if(r.ok){
-            showToast('Trade closed: ' + r.result + ' | PNL: $' + r.pnl.toFixed(2), r.result === 'WIN' ? 'success' : 'info');
+            showToast('Trade closed: ' + r.result + ' | PNL: ' + fmtCurrency(r.pnl), r.result === 'WIN' ? 'success' : 'info');
             loadActiveTrades();
             loadJournal();
         } else {
@@ -2874,16 +3311,22 @@ async function closeTrade(id){
 
 // ===== SETTINGS =====
 async function saveSettings(){
+    const cur = document.getElementById('set_currency').value;
     await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
         symbol: document.getElementById('set_symbol').value,
         twelvedata_api_key: document.getElementById('set_td').value,
         initial_balance: document.getElementById('set_balance').value,
+        balance_credit: document.getElementById('set_credit').value,
         risk_percent: document.getElementById('set_risk').value,
         pip_value_per_lot: document.getElementById('set_pip').value,
         refresh_seconds: document.getElementById('set_refresh').value,
-        theme: document.documentElement.dataset.theme
+        theme: document.documentElement.dataset.theme,
+        currency: cur,
+        exchange_rate_usd_idr: document.getElementById('set_rate').value
     })});
     refreshSec = parseInt(document.getElementById('set_refresh').value || 10);
+    appCurrency = cur;
+    usdIdrRate = parseFloat(document.getElementById('set_rate').value) || 15500;
     showToast('Settings tersimpan', 'success');
     startTimer();
     loadMarket();
@@ -2908,7 +3351,6 @@ function renderAnalytics(){
         return;
     }
 
-    // Equity curve
     const container = document.getElementById('equityChart');
     container.innerHTML = '';
     if(!equityChartRef){
@@ -2928,7 +3370,6 @@ function renderAnalytics(){
         bottomColor: 'rgba(52,211,153,0)',
     });
 
-    // Cumulative PNL reversed (oldest first)
     const reversed = [...allJournalData].reverse();
     let cum = parseFloat(document.getElementById('r_balance').value || 1000) - (reversed.reduce((s,r) => s + parseFloat(r.pnl||0), 0));
     const eqData = reversed.map(r => {
@@ -2940,7 +3381,6 @@ function renderAnalytics(){
         equityChartRef.timeScale().fitContent();
     }
 
-    // Pie chart
     const wins = allJournalData.filter(r => (r.result||'').toUpperCase() === 'WIN' || parseFloat(r.pnl||0) > 0).length;
     const losses = allJournalData.filter(r => (r.result||'').toUpperCase() === 'LOSS' || parseFloat(r.pnl||0) < 0).length;
     const be = allJournalData.filter(r => (r.result||'').toUpperCase() === 'BE' || parseFloat(r.pnl||0) === 0).length;
@@ -2951,7 +3391,6 @@ function renderAnalytics(){
         '<div style="position:relative;background:var(--card);border-radius:50%;width:80px;height:80px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-weight:700;font-size:16px">' + wins + '/' + losses + '<span style="font-size:11px;font-weight:400;color:var(--mut)">W/L</span></div></div>' +
         '<div style="margin-top:8px;font-size:12px;display:flex;gap:16px;justify-content:center"><span><span style="color:var(--green)">●</span> Win ' + wins + '</span><span><span style="color:var(--red)">●</span> Loss ' + losses + '</span><span><span style="color:var(--gold)">●</span> BE ' + be + '</span></div>';
 
-    // Monthly chart
     const months = {};
     allJournalData.forEach(r => {
         const m = (r.created_at||'').slice(0,7);
@@ -2963,12 +3402,11 @@ function renderAnalytics(){
         '<div style="display:flex;align-items:flex-end;gap:6px;height:200px;padding:10px 0">' +
         Object.entries(months).map(([m,v]) =>
             '<div style="flex:1;display:flex;flex-direction:column;align-items:center;height:100%;justify-content:flex-end">' +
-            '<span style="font-size:10px;color:var(--mut);margin-bottom:2px">' + (v>0?'+':'') + v.toFixed(0) + '</span>' +
+            '<span style="font-size:10px;color:var(--mut);margin-bottom:2px">' + (v>0?'+':'') + fmtCurrency(v) + '</span>' +
             '<div style="width:100%;height:' + Math.max(3, Math.abs(v) / Math.max(...Object.values(months).map(x=>Math.abs(x))) * 160) + 'px;background:' + (v>=0?'var(--green)':'var(--red)') + ';border-radius:4px 4px 0 0;transition:height .3s"></div>' +
             '<span style="font-size:9px;color:var(--mut);margin-top:4px;writing-mode:vertical-lr;text-orientation:mixed;height:30px;overflow:hidden;text-overflow:ellipsis">' + m.slice(5) + '</span></div>'
         ).join('') + '</div>';
 
-    // Performance summary
     const stats = allJournalData.reduce((acc, r) => {
         acc.count++;
         const p = parseFloat(r.pnl||0);
@@ -2982,7 +3420,7 @@ function renderAnalytics(){
         '<div class="kpi-grid" style="grid-template-columns:repeat(auto-fill,minmax(160px,1fr))">' +
         '<div class="kpi-box"><span class="val">' + stats.count + '</span><span class="lbl">Total</span></div>' +
         '<div class="kpi-box"><span class="val">' + (stats.wins+stats.losses > 0 ? (stats.wins/(stats.wins+stats.losses)*100).toFixed(1) + '%' : '-') + '</span><span class="lbl">Winrate</span></div>' +
-        '<div class="kpi-box"><span class="val" style="color:' + (stats.totalPnl>=0?'var(--green)':'var(--red)') + '">$' + stats.totalPnl.toFixed(2) + '</span><span class="lbl">Net PNL</span></div>' +
+        '<div class="kpi-box"><span class="val" style="color:' + (stats.totalPnl>=0?'var(--green)':'var(--red)') + '">' + fmtCurrency(stats.totalPnl) + '</span><span class="lbl">Net PNL</span></div>' +
         '<div class="kpi-box"><span class="val">' + (stats.grossLoss > 0 ? (stats.grossProfit/stats.grossLoss).toFixed(2) : '∞') + '</span><span class="lbl">Profit Factor</span></div>' +
         '<div class="kpi-box"><span class="val">' + (stats.count > 0 ? (stats.totalPnl/stats.count).toFixed(2) : '0') + '</span><span class="lbl">Avg PNL</span></div>' +
         '</div>';
@@ -2990,14 +3428,9 @@ function renderAnalytics(){
 
 // ===== CHART TAB =====
 function loadChartTab(){
-    // Delay dengan setTimeout untuk memastikan browser sudah me-render tab (display:block)
-    // requestAnimationFrame saja tidak cukup karena layout belum dihitung
     setTimeout(() => {
-        // Fix: buat chart saat tab pertama kali dibuka
         if(!chart2Ref) {
             const container = document.getElementById('chart2');
-            // Pastikan container memiliki dimensi
-            console.log('Chart2 container:', container.offsetWidth, container.offsetHeight);
             chart2Ref = LightweightCharts.createChart(container, {
                 layout: {background:{color:'transparent'}, textColor: getComputedStyle(document.documentElement).getPropertyValue('--txt2').trim()},
                 grid: {vertLines:{color:'#9992'}, horzLines:{color:'#9992'}},
@@ -3006,12 +3439,10 @@ function loadChartTab(){
             candles2Ref = chart2Ref.addCandlestickSeries({upColor:'#059669', downColor:'#e11d48', borderVisible:false, wickUpColor:'#059669', wickDownColor:'#e11d48'});
             e20_2Ref = chart2Ref.addLineSeries({color:'#ca8a04', lineWidth:2});
             e50_2Ref = chart2Ref.addLineSeries({color:'#2563eb', lineWidth:2});
-            // Load market data setelah chart terbuat
             loadMarket();
         } else {
             loadMarket();
         }
-        // Force chart resize saat tab terbuka - pakai setTimeout lagi untuk memastikan chart sudah siap
         setTimeout(() => {
             if(chart2Ref) {
                 chart2Ref.timeScale().fitContent();
@@ -3036,6 +3467,8 @@ function updateChartTabSignals(a){
 // ===== SMOOTH CANDLE =====
 function startSmoothSimulation(){
     if(smoothTimer) clearInterval(smoothTimer);
+    // Skip smooth simulation if there are active trades (real price movement needed)
+    if(activeTradesCount > 0) return;
     smoothTimer = setInterval(() => {
         if(!currentCandle) return;
         const delta = (targetPrice - currentCandle.close) * 0.15;
@@ -3046,7 +3479,7 @@ function startSmoothSimulation(){
         currentCandle.low = Math.min(currentCandle.low, currentCandle.close);
         candlesRef.update(currentCandle);
         if(candles2Ref) candles2Ref.update(currentCandle);
-    }, 200);
+    }, 400);
 }
 
 // ===== TIMER =====
@@ -3055,6 +3488,13 @@ function startTimer(){
     timer = setInterval(() => {
         if(document.getElementById('live').checked) loadMarket();
     }, Math.max(5, refreshSec) * 1000);
+    // Auto-check SL/TP every 5 seconds
+    if(checkTimer) clearInterval(checkTimer);
+    checkTimer = setInterval(async () => {
+        try {
+            await fetch('/api/check-trades', {method:'POST'});
+        } catch(e){}
+    }, 5000);
 }
 
 // ===== CANDLE TYPE SWITCHING =====
@@ -3080,7 +3520,6 @@ function changeCandleType(type) {
     if (!rawCandles.length) return;
     let data = type === 'heiken' ? heikinAshi(rawCandles) : rawCandles;
 
-    // Remove extra series from chart
     chartRef.removeSeries(candlesRef);
     e20Ref.setVisible(true);
     e50Ref.setVisible(true);
@@ -3108,16 +3547,24 @@ function changeCandleType(type) {
 
 // ===== POSITION LINES ON CHART =====
 let posLineRefs = [];
+let posMarkers = [];
 async function drawPositionLines(){
-    // Hapus garis lama
     posLineRefs.forEach(ref => {
         try { chartRef.removeSeries(ref); } catch(e){}
     });
     posLineRefs = [];
+    candlesRef.setMarkers([]);
     
     try {
         const data = await fetch('/api/active-trades').then(r => r.json());
         if(!data.rows || data.rows.length === 0) return;
+        
+        // Use first candle time as left bound for lines
+        const firstCandleTime = rawCandles.length > 0 ? rawCandles[0].time : (Math.floor(Date.now() / 1000) - 7200);
+        const currentTime = Math.floor(Date.now() / 1000);
+        const chartEndTime = rawCandles.length > 0 ? rawCandles[rawCandles.length - 1].time : currentTime;
+        
+        let markers = [];
         
         data.rows.forEach(r => {
             const isBuy = r.side === 'BUY';
@@ -3125,18 +3572,18 @@ async function drawPositionLines(){
             const slColor = '#ea580c';
             const tpColor = '#2563eb';
             
-            // Entry line
+            // Entry line - spans from first candle to current candle time
             const entryLine = chartRef.addLineSeries({
                 color: entryColor,
                 lineWidth: 2,
-                lineStyle: 2, // dashed
+                lineStyle: 2,
                 lastValueVisible: true,
                 priceLineVisible: false,
+                title: isBuy ? '▲ ENTRY' : '▼ ENTRY',
             });
-            const now = Math.floor(Date.now() / 1000);
             entryLine.setData([
-                {time: now - 7200, value: r.entry},
-                {time: now, value: r.entry}
+                {time: firstCandleTime, value: r.entry},
+                {time: chartEndTime, value: r.entry}
             ]);
             posLineRefs.push(entryLine);
             
@@ -3148,10 +3595,11 @@ async function drawPositionLines(){
                     lineStyle: 2,
                     lastValueVisible: true,
                     priceLineVisible: false,
+                    title: 'SL',
                 });
                 slLine.setData([
-                    {time: now - 7200, value: r.sl},
-                    {time: now, value: r.sl}
+                    {time: firstCandleTime, value: r.sl},
+                    {time: chartEndTime, value: r.sl}
                 ]);
                 posLineRefs.push(slLine);
             }
@@ -3164,14 +3612,29 @@ async function drawPositionLines(){
                     lineStyle: 2,
                     lastValueVisible: true,
                     priceLineVisible: false,
+                    title: 'TP',
                 });
                 tpLine.setData([
-                    {time: now - 7200, value: r.tp},
-                    {time: now, value: r.tp}
+                    {time: firstCandleTime, value: r.tp},
+                    {time: chartEndTime, value: r.tp}
                 ]);
                 posLineRefs.push(tpLine);
             }
+            
+            // Add marker at entry position (use middle of visible chart area)
+            const markerTime = Math.floor((firstCandleTime + chartEndTime) / 2);
+            markers.push({
+                time: markerTime,
+                position: isBuy ? 'belowBar' : 'aboveBar',
+                color: entryColor,
+                shape: isBuy ? 'arrowUp' : 'arrowDown',
+                text: isBuy ? 'BUY $' + r.entry : 'SELL $' + r.entry,
+            });
         });
+        
+        if(markers.length > 0) {
+            candlesRef.setMarkers(markers);
+        }
     } catch(e){}
 }
 
@@ -3186,7 +3649,6 @@ async function getIDR(usd) {
 
 // ===== INIT =====
 function init(){
-    // Dashboard chart
     chartRef = LightweightCharts.createChart(document.getElementById('chart'), {
         layout: {background:{color:'transparent'}, textColor: getComputedStyle(document.documentElement).getPropertyValue('--txt2').trim()},
         grid: {vertLines:{color:'#9992'}, horzLines:{color:'#9992'}},
@@ -3196,17 +3658,19 @@ function init(){
     e20Ref = chartRef.addLineSeries({color:'#ca8a04', lineWidth:2});
     e50Ref = chartRef.addLineSeries({color:'#2563eb', lineWidth:2});
 
-    // Theme button
     document.getElementById('themeBtn').textContent = '{{theme}}' === 'dark' ? '☀️' : '🌙';
+    document.getElementById('currencyBadge').textContent = appCurrency === 'IDR' ? 'IDR' : 'USD';
 
-    // Load settings
     fetch('/api/settings').then(r => r.json()).then(s => {
         document.getElementById('set_symbol').value = s.symbol;
         document.getElementById('set_td').value = s.twelvedata_api_key;
         document.getElementById('set_balance').value = s.initial_balance;
+        document.getElementById('set_credit').value = s.balance_credit || s.initial_balance;
         document.getElementById('set_risk').value = s.risk_percent;
         document.getElementById('set_pip').value = s.pip_value_per_lot;
         document.getElementById('set_refresh').value = s.refresh_seconds;
+        document.getElementById('set_currency').value = s.currency || 'USD';
+        document.getElementById('set_rate').value = s.exchange_rate_usd_idr || '15500';
         idrCache.rate = parseFloat(s.exchange_rate_usd_idr || 15500);
         refreshSec = parseInt(s.refresh_seconds || 10);
     });
