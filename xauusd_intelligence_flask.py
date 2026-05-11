@@ -32,7 +32,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 
 APP = "XAUUSD Realtime"
-DB = "xauusd_realtime_simple_pro.db"
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+DB = os.path.join(BASE_DIR, "xauusd_realtime_simple_pro.db")
 TZ = timezone(timedelta(hours=7))
 
 app = Flask(__name__)
