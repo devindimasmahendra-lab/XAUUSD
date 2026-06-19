@@ -32,8 +32,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 
 APP = "XAUUSD Realtime"
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DB = os.path.join(BASE_DIR, "xauusd_realtime_simple_pro.db")
+DB = "xauusd_realtime_simple_pro.db"
 TZ = timezone(timedelta(hours=7))
 
 app = Flask(__name__)
@@ -137,8 +136,7 @@ def init_db():
         "default_tf": "15min",
         "twelvedata_api_key": os.getenv("TWELVEDATA_API_KEY", ""),
         "initial_balance": "1000",
-        "balance_credit": "1000",
-        "virtual_balance_enabled": "1",
+        "virtual_balance": "1000",
         "risk_percent": "1",
         "pip_value_per_lot": "1",
         "refresh_seconds": "10",
@@ -190,18 +188,32 @@ def set_setting(key, value):
 
 
 def get_balance_credit():
-    default_balance = get_setting("initial_balance", "1000")
-    return safe_float(get_setting("balance_credit", default_balance), safe_float(default_balance, 1000))
+    # BALANCE CREDIT = computed dari initial_balance + total_journal_PNL
+    # Tapi juga disimpan sebagai virtual_balance untuk quick access
+    return max(0, safe_float(get_setting("virtual_balance", "1000"), 1000))
 
 
-def set_balance_credit(amount):
-    amount = max(0, safe_float(amount))
-    set_setting("balance_credit", round(amount, 2))
-    return round(amount, 2)
+def set_initial_balance(amount):
+    """Set initial_balance + sync virtual_balance agar konsisten."""
+    amt = round(max(0, safe_float(amount)), 2)
+    set_setting("initial_balance", amt)
+    # Sync virtual_balance agar konsisten
+    total_pnl = sum(safe_float(x.get("pnl")) for x in journal_rows())
+    vb = max(0, amt + total_pnl)
+    set_setting("virtual_balance", round(vb, 2))
+    return safe_float(get_setting("initial_balance", "0"))
 
 
-def adjust_balance_credit(delta):
-    return set_balance_credit(get_balance_credit() + safe_float(delta))
+def add_initial_balance(delta):
+    """Tambah/kurang credit dengan adjust ke initial_balance dan sync."""
+    current_initial = safe_float(get_setting("initial_balance", "1000"), 1000)
+    new_initial = max(0, current_initial + safe_float(delta))
+    set_setting("initial_balance", round(new_initial, 2))
+    # Sync virtual_balance
+    total_pnl = sum(safe_float(x.get("pnl")) for x in journal_rows())
+    vb = max(0, new_initial + total_pnl)
+    set_setting("virtual_balance", round(vb, 2))
+    return round(vb, 2)
 
 
 # ============================================================
@@ -1341,8 +1353,6 @@ def analyze(candles, tf="15min"):
     
     risk_multiplier += (100 - confidence) / 150
     
-    opens = [x["open"] for x in candles]
-    
     if signal == "BUY":
         entry = price
         sl = price - base_risk * risk_multiplier
@@ -1417,9 +1427,10 @@ def calc_stats():
     rows = journal_rows()
 
     initial = safe_float(get_setting("initial_balance", "1000"), 1000)
-    balance_credit = get_balance_credit()
     pnl = sum(safe_float(x.get("pnl")) for x in rows)
     balance = initial + pnl
+    # balance_credit baca dari virtual_balance (sudah disync oleh set_initial_balance/add_initial_balance)
+    balance_credit = max(0, safe_float(get_setting("virtual_balance", "1000"), 1000))
 
     closed = [
         x for x in rows
@@ -1508,8 +1519,6 @@ def api_settings():
         "symbol",
         "default_tf",
         "twelvedata_api_key",
-        "initial_balance",
-        "balance_credit",
         "virtual_balance_enabled",
         "risk_percent",
         "pip_value_per_lot",
@@ -1529,37 +1538,56 @@ def api_settings():
                 set_setting(k, data[k])
         return jsonify(ok=True)
 
-    return jsonify({k: get_setting(k) for k in keys})
+    result = {k: get_setting(k) for k in keys}
+    # Tambah virtual_balance computed untuk frontend
+    result["virtual_balance"] = get_setting("virtual_balance", "1000")
+    return jsonify(result)
 
 
 @app.route("/api/balance-credit", methods=["POST"])
 @login_required
 def api_balance_credit():
+    """SET balance_credit ke nilai tertentu.
+    Hitung initial_balance = target_credit - total_journal_PNL,
+    lalu sync virtual_balance = target_credit."""
     data = request.get_json(force=True)
-    amount = set_balance_credit(data.get("amount", 0))
-    return jsonify(ok=True, balance_credit=amount, stats=calc_stats())
+    target = safe_float(data.get("amount", 0))
+    total_pnl = sum(safe_float(x.get("pnl")) for x in journal_rows())
+    initial = max(0, target - total_pnl)
+    set_setting("initial_balance", round(initial, 2))
+    set_setting("virtual_balance", str(max(0, round(target, 2))))
+    stats = calc_stats()
+    return jsonify(ok=True, balance_credit=stats["balance_credit"], stats=stats)
 
 
 @app.route("/api/balance-credit/reset", methods=["POST"])
 @login_required
 def api_balance_credit_reset():
-    amount = set_balance_credit(get_setting("initial_balance", "1000"))
-    return jsonify(ok=True, balance_credit=amount, stats=calc_stats())
+    # Reset initial_balance ke default 1000 + sync virtual_balance
+    set_setting("initial_balance", "1000")
+    total_pnl = sum(safe_float(x.get("pnl")) for x in journal_rows())
+    set_setting("virtual_balance", str(max(0, 1000 + total_pnl)))
+    stats = calc_stats()
+    return jsonify(ok=True, balance_credit=stats["balance_credit"], stats=stats)
 
 
 @app.route("/api/balance-credit/add", methods=["POST"])
 @login_required
 def api_balance_credit_add():
     data = request.get_json(force=True)
-    amount = adjust_balance_credit(data.get("amount", 0))
+    amount = add_initial_balance(data.get("amount", 0))
     return jsonify(ok=True, balance_credit=amount, stats=calc_stats())
 
 
 @app.route("/api/balance-credit/clear", methods=["POST"])
 @login_required
 def api_balance_credit_clear():
-    amount = set_balance_credit(0)
-    return jsonify(ok=True, balance_credit=amount, stats=calc_stats())
+    """Kosongkan balance credit jadi 0 (Sync virtual_balance)."""
+    total_pnl = sum(safe_float(x.get("pnl")) for x in journal_rows())
+    set_setting("initial_balance", round(-total_pnl, 2))
+    set_setting("virtual_balance", "0")
+    stats = calc_stats()
+    return jsonify(ok=True, balance_credit=stats["balance_credit"], stats=stats)
 
 
 @app.route("/api/market")
@@ -1696,7 +1724,6 @@ def api_journal():
         conn.commit()
         conn.close()
 
-        adjust_balance_credit(pnl)
         learn_from_trade(data.get("timeframe"), data.get("side"), pnl)
 
         return jsonify(ok=True, stats=calc_stats())
@@ -1746,8 +1773,7 @@ def api_active_trades():
         return jsonify(ok=True)
     
     if request.method == "DELETE":
-        tid = request.args.get("id")
-        close_price = safe_float(request.args.get("close_price"))
+        # Tidak dipakai frontend. Biarkan sebagai no-op aman.
         conn.close()
         return jsonify(ok=True)
 
@@ -1855,7 +1881,7 @@ def close_trade(trade_id, close_price, close_type):
     
     conn.commit()
     conn.close()
-    adjust_balance_credit(pnl)
+    # balance_credit dihitung otomatis dari journal PNL, tidak perlu adjust manual
     learn_from_trade(trade.get("timeframe", ""), trade["side"], pnl)
     return {"result": result, "pnl": round(pnl, 2), "close_price": round(close_price, 2)}
 
@@ -2515,12 +2541,17 @@ tr:hover td{background:var(--card2)}
             <button class="btn btn-primary" onclick="loadMarket()">⟳ Refresh</button>
             <button class="btn" id="themeBtn" onclick="toggleTheme()">🌙</button>
             <span id="currencyBadge" style="font-size:12px;padding:4px 8px;background:var(--card2);border-radius:8px;color:var(--gold);font-weight:600">USD</span>
+            <span id="creditBadge" style="font-size:12px;padding:4px 10px;background:var(--gold-bg);border-radius:8px;color:var(--gold);font-weight:700;border:1px solid var(--gold)">💰 <span id="creditValue">$0</span></span>
+            <input id="manualLot" class="input" placeholder="Lot" style="width:60px;padding:4px 6px;font-size:11px;height:32px" type="number" step="0.01" min="0.01">
+            <button class="btn btn-primary" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="quickTrade('BUY')">📈 BUY</button>
+            <button class="btn btn-danger" onclick="quickTrade('SELL')">📉 SELL</button>
         </div>
     </div>
 
     <div class="content" id="contentArea">
         <!-- ===== TAB: DASHBOARD ===== -->
         <div class="tab active" id="tab-dashboard">
+            <!-- Signal Box (Paling Atas) -->
             <div class="card">
                 <div id="signalBox" class="signal-box wait">
                     <div id="signalText" class="signal-text wait">WAIT</div>
@@ -2535,28 +2566,20 @@ tr:hover td{background:var(--card2)}
                 <div id="warnings" style="margin-top:8px"></div>
             </div>
 
+            <!-- Market Overview - Chart (Paling Atas) -->
             <div class="card">
-                <div class="card-header"><span class="card-title">🧠 AI Memory & News Bias</span></div>
-                <div id="aiBox" class="row" style="font-size:13px;color:var(--txt2)"></div>
-            </div>
-
-            <div class="kpi-grid" id="statsGrid"></div>
-
-            <div class="card" style="margin-top:14px">
-                <div class="card-header"><span class="card-title">💳 Balance Credit / Saldo Virtual</span></div>
-                <div class="row" style="margin-bottom:10px">
-                    <input id="credit_amount" class="input" placeholder="Saldo total / nominal tambah" style="width:190px">
-                    <button class="btn" onclick="addBalanceCredit()">+ Tambah Saldo</button>
-                    <button class="btn btn-primary" onclick="setBalanceCredit()">Set Manual</button>
-                    <button class="btn" onclick="resetBalanceCredit()">Auto dari Initial</button>
-                    <button class="btn btn-danger" onclick="clearBalanceCredit()">Kosongkan</button>
+                <div class="card-header">
+                    <span class="card-title">📊 Market Overview XAU/USD</span>
+                    <div class="row">
+                        <button class="btn btn-primary" onclick="runPrediction()">🔮 Prediksi</button>
+                        <select id="candleType" class="select" style="font-size:11px;padding:5px 8px" onchange="changeCandleType(this.value)">
+                            <option value="candle">🕯️ Candle</option>
+                            <option value="heiken">🌊 Heiken Ashi</option>
+                            <option value="line">📈 Line</option>
+                        </select>
+                    </div>
                 </div>
-                <div class="kpi-grid" id="creditMatrix"></div>
-            </div>
-
-            <div class="card" style="margin-top:14px">
-                <div class="card-header"><span class="card-title">📊 Market Overview</span></div>
-                <div class="row">
+                <div class="row" style="margin-bottom:8px">
                     <button class="btn tf-btn" data-tf="1min" onclick="switchTF('1min')">M1</button>
                     <button class="btn tf-btn" data-tf="3min" onclick="switchTF('3min')">M3</button>
                     <button class="btn tf-btn" data-tf="5min" onclick="switchTF('5min')">M5</button>
@@ -2564,22 +2587,34 @@ tr:hover td{background:var(--card2)}
                     <button class="btn tf-btn" data-tf="1h" onclick="switchTF('1h')">H1</button>
                     <button class="btn tf-btn" data-tf="4h" onclick="switchTF('4h')">H4</button>
                     <button class="btn tf-btn" data-tf="1day" onclick="switchTF('1day')">D1</button>
-                    <select id="candleType" class="select" style="font-size:11px;padding:5px 8px" onchange="changeCandleType(this.value)">
-                        <option value="candle">🕯️ Candle</option>
-                        <option value="heiken">🌊 Heiken Ashi</option>
-                        <option value="line">📈 Line</option>
-                        <option value="area">📊 Area</option>
-                        <option value="bar">📉 Bar</option>
-                    </select>
-                    <div style="flex:1"></div>
-                    <button class="btn btn-primary" id="predBtn" onclick="runPrediction()">🔮 Prediksi</button>
+                    <label style="font-size:12px;color:var(--txt2)">
+                        <input type="checkbox" id="showEma20" checked onchange="e20Ref.setVisible(this.checked)">
+                        EMA20
+                    </label>
+                    <label style="font-size:12px;color:var(--txt2)">
+                        <input type="checkbox" id="showEma50" checked onchange="e50Ref.setVisible(this.checked)">
+                        EMA50
+                    </label>
                 </div>
                 <div id="chart"></div>
             </div>
 
+            <!-- AI Memory & Analysis Row -->
+            <div class="row" style="gap:12px;margin-bottom:12px">
+                <div class="card" style="flex:1">
+                    <div class="card-header"><span class="card-title">🧠 AI Memory</span></div>
+                    <div id="aiBox" class="row" style="font-size:13px;color:var(--txt2)"></div>
+                </div>
+                <div class="card" style="flex:1">
+                    <div class="card-header"><span class="card-title">📋 Analisa AI</span></div>
+                    <div id="reasonBox"></div>
+                </div>
+            </div>
+
+            <!-- Stats (minimal, tanpa credit controls) -->
             <div class="card">
-                <div class="card-header"><span class="card-title">📋 Analisa</span></div>
-                <div id="reasonBox"></div>
+                <div class="card-header"><span class="card-title">📊 Stats</span></div>
+                <div class="kpi-grid" id="statsGrid"></div>
             </div>
         </div>
 
@@ -2702,12 +2737,10 @@ tr:hover td{background:var(--card2)}
         <!-- ===== TAB: SETTINGS ===== -->
         <div class="tab" id="tab-settings">
             <div class="card">
-                <div class="card-header"><span class="card-title">⚙️ Settings</span></div>
+                <div class="card-header"><span class="card-title">⚙️ General Settings</span></div>
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:500px">
                     <input id="set_symbol" class="input" placeholder="Symbol XAU/USD">
                     <input id="set_td" class="input" placeholder="Twelve Data API Key">
-                    <input id="set_balance" class="input" placeholder="Initial Balance">
-                    <input id="set_credit" class="input" placeholder="Balance Credit / Saldo Virtual">
                     <input id="set_risk" class="input" placeholder="Risk %">
                     <input id="set_pip" class="input" placeholder="Pip value per lot">
                     <input id="set_refresh" class="input" placeholder="Refresh seconds">
@@ -2721,6 +2754,24 @@ tr:hover td{background:var(--card2)}
                 </div>
                 <div class="row" style="margin-top:10px">
                     <button class="btn btn-primary" onclick="saveSettings()">💾 Save</button>
+                </div>
+            </div>
+            <!-- Virtual Trading: 1 menu sederhana -->
+            <div class="card">
+                <div class="card-header"><span class="card-title">💰 Virtual Trading</span></div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:500px">
+                    <div>
+                        <label style="font-size:12px;color:var(--txt2);display:block;margin-bottom:4px">Saldo Awal (Initial Balance)</label>
+                        <input id="set_balance" class="input" placeholder="Initial Balance" style="width:100%">
+                    </div>
+                    <div>
+                        <label style="font-size:12px;color:var(--txt2);display:block;margin-bottom:4px">Credit Balance</label>
+                        <input id="set_credit" class="input" placeholder="Credit Balance" style="width:100%">
+                    </div>
+                </div>
+                <div class="row" style="margin-top:10px;gap:8px">
+                    <button class="btn btn-primary" onclick="setBalanceCredit()">💾 Set Credit</button>
+                    <button class="btn" onclick="resetBalanceCredit()">🔄 Reset</button>
                 </div>
             </div>
             <div class="card">
@@ -2867,14 +2918,18 @@ function toUnix(t){
 // ===== RUN PREDICTION =====
 async function runPrediction(){
     const btn = document.getElementById('predBtn');
-    btn.disabled = true;
-    btn.textContent = '⏳...';
+    if(btn){
+        btn.disabled = true;
+        btn.textContent = '⏳...';
+    }
     lastCandleTime = 0;
     await new Promise(r => setTimeout(r, 600));
     await loadMarket();
     fillJournalFromSignal();
-    btn.textContent = '🔮 Prediksi';
-    btn.disabled = false;
+    if(btn){
+        btn.textContent = '🔮 Prediksi';
+        btn.disabled = false;
+    }
 }
 
 // ===== LOAD MARKET =====
@@ -3017,31 +3072,17 @@ function renderStats(s){
         `;
     }
     document.getElementById('r_balance').value = s.balance_credit ?? s.balance;
-    const creditInput = document.getElementById('credit_amount');
-    if(creditInput && !creditInput.value) creditInput.value = s.balance_credit ?? '';
 }
 
 async function setBalanceCredit(){
-    const amount = document.getElementById('credit_amount').value;
+    const amount = document.getElementById('set_credit').value;
     const r = await fetch('/api/balance-credit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({amount})}).then(r => r.json());
     if(r.ok){ showToast('Balance credit di-set: ' + fmtCurrency(r.balance_credit), 'success'); renderStats(r.stats); }
 }
 
-async function addBalanceCredit(){
-    const amount = document.getElementById('credit_amount').value;
-    const r = await fetch('/api/balance-credit/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({amount})}).then(r => r.json());
-    if(r.ok){ document.getElementById('credit_amount').value = r.balance_credit; showToast('Saldo ditambah. Balance credit: ' + fmtCurrency(r.balance_credit), 'success'); renderStats(r.stats); }
-}
-
 async function resetBalanceCredit(){
     const r = await fetch('/api/balance-credit/reset', {method:'POST'}).then(r => r.json());
-    if(r.ok){ document.getElementById('credit_amount').value = r.balance_credit; showToast('Balance credit otomatis dari initial balance', 'success'); renderStats(r.stats); }
-}
-
-async function clearBalanceCredit(){
-    if(!confirm('Kosongkan balance credit menjadi 0?')) return;
-    const r = await fetch('/api/balance-credit/clear', {method:'POST'}).then(r => r.json());
-    if(r.ok){ document.getElementById('credit_amount').value = 0; showToast('Balance credit dikosongkan', 'info'); renderStats(r.stats); }
+    if(r.ok){ showToast('Balance credit di-reset: ' + fmtCurrency(r.balance_credit), 'success'); renderStats(r.stats); }
 }
 
 // ===== LOAD JOURNAL =====
@@ -3317,7 +3358,6 @@ async function saveSettings(){
         symbol: document.getElementById('set_symbol').value,
         twelvedata_api_key: document.getElementById('set_td').value,
         initial_balance: document.getElementById('set_balance').value,
-        balance_credit: document.getElementById('set_credit').value,
         risk_percent: document.getElementById('set_risk').value,
         pip_value_per_lot: document.getElementById('set_pip').value,
         refresh_seconds: document.getElementById('set_refresh').value,
@@ -3331,6 +3371,61 @@ async function saveSettings(){
     showToast('Settings tersimpan', 'success');
     startTimer();
     loadMarket();
+}
+
+// ===== QUICK TRADE (1-menu buy/sell) =====
+async function quickTrade(side){
+    const balance = parseFloat(document.getElementById('r_balance').value.replace(/[^0-9.-]/g,'')) || 1000;
+    const riskPct = parseFloat(document.getElementById('set_risk').value || 1);
+    const riskAmt = balance * riskPct / 100;
+    const pipVal = parseFloat(document.getElementById('set_pip').value || 1);
+    
+    // Ambil harga saat ini dari chart
+    const last = currentCandle ? currentCandle.close : 0;
+    if(!last || last <= 0){
+        showToast('Belum ada harga, tunggu data market', 'error');
+        return;
+    }
+    
+    // Gunakan default SL/TP sederhana: SL 10 poin, TP 20 poin
+    const sl = side === 'BUY' ? last - 10 : last + 10;
+    const tp = side === 'BUY' ? last + 20 : last - 20;
+    const distance = Math.abs(last - sl);
+    
+    // Cek manual lot input terlebih dahulu
+    const manualLot = parseFloat(document.getElementById('manualLot').value);
+    let lot;
+    if(manualLot && manualLot > 0){
+        lot = Math.min(Math.max(manualLot, 0.01), 5);
+    } else {
+        lot = Math.round(riskAmt / Math.max(distance * pipVal, 0.00001) * 1000) / 1000;
+        lot = Math.min(Math.max(lot, 0.01), 5);
+    }
+    
+    try {
+        const res = await fetch('/api/active-trades', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+            timeframe: currentTF,
+            side: side,
+            entry: last,
+            sl: round(sl, 2),
+            tp: round(tp, 2),
+            lot: lot,
+            note: 'Quick ' + side + (manualLot && manualLot > 0 ? ' (Manual Lot)' : '')
+        })}).then(r => r.json());
+        
+        if(res.ok !== false){
+            showToast('⚡ ' + side + ' @ ' + fmtPrice(last) + ' | Lot: ' + lot.toFixed(2), 'success');
+            loadActiveTrades();
+        } else {
+            showToast('Gagal buka trade: ' + (res.error || 'Unknown'), 'error');
+        }
+    } catch(e){
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+function round(val, dec){
+    return Math.round(val * Math.pow(10, dec)) / Math.pow(10, dec);
 }
 
 async function changePass(){
@@ -3437,7 +3532,7 @@ function loadChartTab(){
                 grid: {vertLines:{color:'#9992'}, horzLines:{color:'#9992'}},
                 height: 480,
             });
-            candles2Ref = chart2Ref.addCandlestickSeries({upColor:'#059669', downColor:'#e11d48', borderVisible:false, wickUpColor:'#059669', wickDownColor:'#e11d48'});
+            candles2Ref = chart2Ref.addCandlestickSeries({upColor:'#e11d48', downColor:'#059669', borderVisible:false, wickUpColor:'#e11d48', wickDownColor:'#059669'});
             e20_2Ref = chart2Ref.addLineSeries({color:'#ca8a04', lineWidth:2});
             e50_2Ref = chart2Ref.addLineSeries({color:'#2563eb', lineWidth:2});
             loadMarket();
@@ -3521,25 +3616,28 @@ function changeCandleType(type) {
     if (!rawCandles.length) return;
     let data = type === 'heiken' ? heikinAshi(rawCandles) : rawCandles;
 
+    // Remove old series first
     chartRef.removeSeries(candlesRef);
-    e20Ref.setVisible(true);
-    e50Ref.setVisible(true);
+    if (e20Ref) chartRef.removeSeries(e20Ref);
+    if (e50Ref) chartRef.removeSeries(e50Ref);
 
     if (type === 'line') {
-        e20Ref.setVisible(false);
-        e50Ref.setVisible(false);
         candlesRef = chartRef.addLineSeries({ color: '#2563eb', lineWidth: 2, priceFormat: { type: 'price' } });
         candlesRef.setData(data.map(x => ({ time: x.time, value: x.close })));
     } else if (type === 'area') {
-        e20Ref.setVisible(false);
-        e50Ref.setVisible(false);
         candlesRef = chartRef.addAreaSeries({ color: 'rgba(37,99,235,0.2)', lineColor: '#2563eb', lineWidth: 2, topColor: 'rgba(37,99,235,0.2)', bottomColor: 'rgba(37,99,235,0)' });
         candlesRef.setData(data.map(x => ({ time: x.time, value: x.close })));
     } else {
         candleType = type;
         const isHA = type === 'heiken';
-        candlesRef = chartRef.addCandlestickSeries({ upColor: '#059669', downColor: '#e11d48', borderVisible: false, wickUpColor: '#059669', wickDownColor: '#e11d48' });
+        candlesRef = chartRef.addCandlestickSeries({ upColor: '#e11d48', downColor: '#059669', borderVisible: false, wickUpColor: '#e11d48', wickDownColor: '#059669' });
         candlesRef.setData(data);
+        // Re-add EMA series for candle/area type
+        e20Ref = chartRef.addLineSeries({color:'#ca8a04', lineWidth:2});
+        e50Ref = chartRef.addLineSeries({color:'#2563eb', lineWidth:2});
+        const closes = data.map(x => x.close);
+        e20Ref.setData(data.map((x, i) => ({time: x.time, value: ema(closes, 20)[i]})));
+        e50Ref.setData(data.map((x, i) => ({time: x.time, value: ema(closes, 50)[i]})));
     }
     if (type !== 'candle' && type !== 'heiken') {
         chartRef.timeScale().fitContent();
@@ -3550,6 +3648,7 @@ function changeCandleType(type) {
 let posLineRefs = [];
 let posMarkers = [];
 async function drawPositionLines(){
+    // Remove old position lines
     posLineRefs.forEach(ref => {
         try { chartRef.removeSeries(ref); } catch(e){}
     });
@@ -3566,8 +3665,9 @@ async function drawPositionLines(){
         const chartEndTime = rawCandles.length > 0 ? rawCandles[rawCandles.length - 1].time : currentTime;
         
         let markers = [];
+        const now = Date.now();
         
-        data.rows.forEach(r => {
+        data.rows.forEach((r, idx) => {
             const isBuy = r.side === 'BUY';
             const entryColor = isBuy ? '#059669' : '#dc2626';
             const slColor = '#ea580c';
@@ -3580,7 +3680,7 @@ async function drawPositionLines(){
                 lineStyle: 2,
                 lastValueVisible: true,
                 priceLineVisible: false,
-                title: isBuy ? '▲ ENTRY' : '▼ ENTRY',
+                title: (isBuy ? '▲ ENTRY ' : '▼ ENTRY ') + (idx + 1),
             });
             entryLine.setData([
                 {time: firstCandleTime, value: r.entry},
@@ -3596,7 +3696,7 @@ async function drawPositionLines(){
                     lineStyle: 2,
                     lastValueVisible: true,
                     priceLineVisible: false,
-                    title: 'SL',
+                    title: 'SL ' + (idx + 1),
                 });
                 slLine.setData([
                     {time: firstCandleTime, value: r.sl},
@@ -3613,7 +3713,7 @@ async function drawPositionLines(){
                     lineStyle: 2,
                     lastValueVisible: true,
                     priceLineVisible: false,
-                    title: 'TP',
+                    title: 'TP ' + (idx + 1),
                 });
                 tpLine.setData([
                     {time: firstCandleTime, value: r.tp},
@@ -3623,13 +3723,14 @@ async function drawPositionLines(){
             }
             
             // Add marker at entry position (use middle of visible chart area)
-            const markerTime = Math.floor((firstCandleTime + chartEndTime) / 2);
+            // Offset each marker slightly so they don't overlap
+            const markerTime = Math.floor((firstCandleTime + chartEndTime) / 2) + (idx * 60);
             markers.push({
                 time: markerTime,
                 position: isBuy ? 'belowBar' : 'aboveBar',
                 color: entryColor,
                 shape: isBuy ? 'arrowUp' : 'arrowDown',
-                text: isBuy ? 'BUY $' + r.entry : 'SELL $' + r.entry,
+                text: (isBuy ? 'BUY' : 'SELL') + ' #' + (idx + 1) + ' $' + r.entry,
             });
         });
         
@@ -3655,7 +3756,7 @@ function init(){
         grid: {vertLines:{color:'#9992'}, horzLines:{color:'#9992'}},
         height: 480,
     });
-    candlesRef = chartRef.addCandlestickSeries({upColor:'#059669', downColor:'#e11d48', borderVisible:false, wickUpColor:'#059669', wickDownColor:'#e11d48'});
+    candlesRef = chartRef.addCandlestickSeries({upColor:'#e11d48', downColor:'#059669', borderVisible:false, wickUpColor:'#e11d48', wickDownColor:'#059669'});
     e20Ref = chartRef.addLineSeries({color:'#ca8a04', lineWidth:2});
     e50Ref = chartRef.addLineSeries({color:'#2563eb', lineWidth:2});
 
@@ -3690,8 +3791,10 @@ init();
 </html>
 '''
 
+
 if __name__ == "__main__":
-
     init_db()
-
-    app.run(host="0.0.0.0", port=4000)
+    print("\n" + APP)
+    print("URL   : http://127.0.0.1:4000")
+    print("Login : admin / admin123")
+    app.run(host="127.0.0.1", port=4000, debug=True)
