@@ -125,6 +125,88 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS alerts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT,
+            symbol TEXT,
+            direction TEXT,
+            target_price REAL,
+            triggered INTEGER DEFAULT 0,
+            triggered_at TEXT,
+            active INTEGER DEFAULT 1
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT UNIQUE,
+            note TEXT,
+            added_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS trade_plans(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT,
+            symbol TEXT,
+            timeframe TEXT,
+            bias TEXT,
+            entry_zone TEXT,
+            sl REAL,
+            tp REAL,
+            setup_type TEXT,
+            rationale TEXT,
+            result TEXT,
+            pnl REAL,
+            closed_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_results(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT,
+            symbol TEXT,
+            timeframe TEXT,
+            start_date TEXT,
+            end_date TEXT,
+            total_trades INTEGER,
+            wins INTEGER,
+            losses INTEGER,
+            winrate REAL,
+            total_pnl REAL,
+            max_drawdown REAL,
+            profit_factor REAL,
+            config TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_trades(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            result_id INTEGER,
+            entry_time TEXT,
+            exit_time TEXT,
+            side TEXT,
+            entry_price REAL,
+            exit_price REAL,
+            pnl REAL,
+            result TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS telegram_config(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_token TEXT DEFAULT '',
+            chat_id TEXT DEFAULT '',
+            enabled INTEGER DEFAULT 0
+        )
+    """)
+
     if cur.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"] == 0:
         cur.execute(
             "INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)",
@@ -2002,6 +2084,499 @@ def api_close_trade(tid):
 
 
 # ============================================================
+# MULTI-SYMBOL
+# ============================================================
+
+SYMBOL_MAP = {
+    "XAU/USD": "GC=F",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "AUD/USD": "AUDUSD=X",
+    "NZD/USD": "NZDUSD=X",
+    "USD/CAD": "USDCAD=X",
+    "USD/CHF": "USDCHF=X",
+    "USD/JPY": "USDJPY=X",
+    "GBP/JPY": "GBPJPY=X",
+    "BTC/USD": "BTC-USD",
+    "ETH/USD": "ETH-USD",
+    "S&P500": "^GSPC",
+    "US30": "^DJI",
+}
+
+def get_yfinance_symbol(symbol):
+    return SYMBOL_MAP.get(symbol, "GC=F")
+
+
+def fetch_candles_symbol(symbol, tf="15min", size=150):
+    tf = tf_ok(tf)
+    if yf is None:
+        return demo_candles(size, tf), "yfinance tidak terinstall"
+    interval_map = {"1min":"1m","3min":"5m","5min":"5m","15min":"15m","30min":"30m","45min":"30m","1h":"60m","2h":"60m","4h":"60m","1day":"1d"}
+    period_map = {"1m":"1d","5m":"2d","15m":"5d","30m":"1mo","60m":"1mo","1d":"3mo"}
+    interval = interval_map.get(tf, "15m")
+    period = period_map.get(interval, "1mo")
+    ticker = get_yfinance_symbol(symbol)
+    try:
+        df = yf.download(tickers=ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return demo_candles(size, tf), "data kosong"
+        rows = []
+        for idx, row in df.iterrows():
+            dt_str = idx.strftime("%Y-%m-%d %H:%M:%S") if hasattr(idx, 'strftime') else str(idx)
+            rows.append({
+                "time": dt_str,
+                "open": round(float(row.iloc[0]), 2),
+                "high": round(float(row.iloc[1]), 2),
+                "low": round(float(row.iloc[2]), 2),
+                "close": round(float(row.iloc[3]), 2),
+            })
+        return rows[-size:], f"YAHOO ({symbol})"
+    except Exception as e:
+        return demo_candles(size, tf), f"error: {e}"
+
+
+@app.route("/api/symbols")
+@login_required
+def api_symbols():
+    symbols = list(SYMBOL_MAP.keys())
+    return jsonify(ok=True, symbols=symbols)
+
+
+@app.route("/api/market-symbol")
+@login_required
+def api_market_symbol():
+    symbol = request.args.get("symbol", get_setting("symbol", "XAU/USD"))
+    tf = tf_ok(request.args.get("tf", get_setting("default_tf", "15min")))
+    candles, status = fetch_candles_symbol(symbol, tf, 150)
+    closes = [x["close"] for x in candles]
+    return jsonify(
+        status=status,
+        server_time=now(),
+        symbol=symbol,
+        candles=candles,
+        ema20=series(candles, ema(closes, 20)),
+        ema50=series(candles, ema(closes, 50)),
+        analysis=analyze(candles, tf),
+        stats=calc_stats(),
+    )
+
+
+# ============================================================
+# ALERTS
+# ============================================================
+
+@app.route("/api/alerts", methods=["GET", "POST"])
+@login_required
+def api_alerts():
+    conn = db()
+    if request.method == "POST":
+        data = request.get_json(force=True)
+        conn.execute("INSERT INTO alerts(created_at,symbol,direction,target_price) VALUES(?,?,?,?)",
+            (now(), get_setting("symbol", "XAU/USD"), data.get("direction"), safe_float(data.get("target_price"))))
+        conn.commit()
+        conn.close()
+        return jsonify(ok=True)
+    rows = [dict(x) for x in conn.execute("SELECT * FROM alerts WHERE active=1 ORDER BY id DESC").fetchall()]
+    conn.close()
+    return jsonify(rows=rows)
+
+
+@app.route("/api/alerts/<int:aid>", methods=["DELETE"])
+@login_required
+def api_alerts_delete(aid):
+    conn = db()
+    conn.execute("DELETE FROM alerts WHERE id=?", (aid,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.route("/api/alerts/<int:aid>/toggle", methods=["POST"])
+@login_required
+def api_alerts_toggle(aid):
+    conn = db()
+    conn.execute("UPDATE alerts SET active = CASE WHEN active=1 THEN 0 ELSE 1 END WHERE id=?", (aid,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+def check_alerts(price):
+    conn = db()
+    alerts = [dict(x) for x in conn.execute("SELECT * FROM alerts WHERE active=1 AND triggered=0").fetchall()]
+    triggered = []
+    for a in alerts:
+        hit = False
+        if a["direction"] == "ABOVE" and price >= a["target_price"]:
+            hit = True
+        elif a["direction"] == "BELOW" and price <= a["target_price"]:
+            hit = True
+        if hit:
+            conn.execute("UPDATE alerts SET triggered=1, triggered_at=? WHERE id=?", (now(), a["id"]))
+            triggered.append(a["id"])
+    conn.commit()
+    conn.close()
+    return triggered
+
+
+# ============================================================
+# WATCHLIST
+# ============================================================
+
+@app.route("/api/watchlist", methods=["GET", "POST"])
+@login_required
+def api_watchlist():
+    conn = db()
+    if request.method == "POST":
+        data = request.get_json(force=True)
+        symbol = data.get("symbol", "").strip()
+        if symbol:
+            try:
+                conn.execute("INSERT OR IGNORE INTO watchlist(symbol,note,added_at) VALUES(?,?,?)",
+                    (symbol, data.get("note", ""), now()))
+            except Exception:
+                pass
+        conn.commit()
+        conn.close()
+        return jsonify(ok=True)
+    rows = [dict(x) for x in conn.execute("SELECT * FROM watchlist ORDER BY added_at DESC").fetchall()]
+    conn.close()
+    return jsonify(rows=rows)
+
+
+@app.route("/api/watchlist/<int:wid>", methods=["DELETE"])
+@login_required
+def api_watchlist_delete(wid):
+    conn = db()
+    conn.execute("DELETE FROM watchlist WHERE id=?", (wid,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ============================================================
+# TRADE PLANS
+# ============================================================
+
+@app.route("/api/trade-plans", methods=["GET", "POST"])
+@login_required
+def api_trade_plans():
+    conn = db()
+    if request.method == "POST":
+        data = request.get_json(force=True)
+        conn.execute("""
+            INSERT INTO trade_plans(created_at,symbol,timeframe,bias,entry_zone,sl,tp,setup_type,rationale)
+            VALUES(?,?,?,?,?,?,?,?,?)
+        """, (now(), data.get("symbol", get_setting("symbol")), data.get("timeframe"), data.get("bias"),
+              data.get("entry_zone"), safe_float(data.get("sl")), safe_float(data.get("tp")),
+              data.get("setup_type"), data.get("rationale")))
+        conn.commit()
+        conn.close()
+        return jsonify(ok=True)
+    rows = [dict(x) for x in conn.execute("SELECT * FROM trade_plans ORDER BY id DESC").fetchall()]
+    conn.close()
+    return jsonify(rows=rows)
+
+
+@app.route("/api/trade-plans/<int:tpid>", methods=["POST"])
+@login_required
+def api_trade_plans_update(tpid):
+    data = request.get_json(force=True)
+    conn = db()
+    conn.execute("UPDATE trade_plans SET result=?, pnl=?, closed_at=? WHERE id=?",
+        (data.get("result"), safe_float(data.get("pnl")), now(), tpid))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ============================================================
+# BACKTEST
+# ============================================================
+
+def run_backtest(symbol, tf, days_back=30, sl_points=10, tp_points=20, fixed_lot=0.1):
+    candles, status = fetch_candles_symbol(symbol, tf, min(days_back * 96, 2000))
+    if len(candles) < 50:
+        return {"error": "Data tidak cukup"}
+    closes = [x["close"] for x in candles]
+    entries = []
+    balance = 1000
+    wins = losses = 0
+    peak = balance
+    max_dd = 0
+    for i in range(20, len(candles) - 1):
+        slice_candles = candles[:i+1]
+        an = analyze(slice_candles, tf)
+        if an["signal"] == "BUY" and an["confidence"] >= 60:
+            entry = candles[i]["close"]
+            sl = entry - sl_points
+            tp = entry + tp_points
+            risk = entry - sl
+            for j in range(i+1, min(i+50, len(candles))):
+                if candles[j]["low"] <= sl:
+                    pnl = -risk * fixed_lot
+                    losses += 1
+                    balance += pnl
+                    entries.append({"entry_time": candles[i]["time"], "exit_time": candles[j]["time"], "side": "BUY", "entry_price": entry, "exit_price": sl, "pnl": round(pnl, 2), "result": "LOSS"})
+                    break
+                elif candles[j]["high"] >= tp:
+                    pnl = (tp - entry) * fixed_lot
+                    wins += 1
+                    balance += pnl
+                    entries.append({"entry_time": candles[i]["time"], "exit_time": candles[j]["time"], "side": "BUY", "entry_price": entry, "exit_price": tp, "pnl": round(pnl, 2), "result": "WIN"})
+                    break
+        elif an["signal"] == "SELL" and an["confidence"] >= 60:
+            entry = candles[i]["close"]
+            sl = entry + sl_points
+            tp = entry - tp_points
+            risk = sl - entry
+            for j in range(i+1, min(i+50, len(candles))):
+                if candles[j]["high"] >= sl:
+                    pnl = -risk * fixed_lot
+                    losses += 1
+                    balance += pnl
+                    entries.append({"entry_time": candles[i]["time"], "exit_time": candles[j]["time"], "side": "SELL", "entry_price": entry, "exit_price": sl, "pnl": round(pnl, 2), "result": "LOSS"})
+                    break
+                elif candles[j]["low"] <= tp:
+                    pnl = (entry - tp) * fixed_lot
+                    wins += 1
+                    balance += pnl
+                    entries.append({"entry_time": candles[i]["time"], "exit_time": candles[j]["time"], "side": "SELL", "entry_price": entry, "exit_price": tp, "pnl": round(pnl, 2), "result": "WIN"})
+                    break
+        peak = max(peak, balance)
+        max_dd = max(max_dd, (peak - balance) / peak * 100 if peak > 0 else 0)
+    total = wins + losses
+    gross_profit = sum(max(0, e["pnl"]) for e in entries)
+    gross_loss = abs(sum(min(0, e["pnl"]) for e in entries))
+    return {
+        "symbol": symbol, "timeframe": tf, "total_trades": total, "wins": wins, "losses": losses,
+        "winrate": round(wins / max(1, total) * 100, 1), "total_pnl": round(balance - 1000, 2),
+        "max_drawdown": round(max_dd, 1),
+        "profit_factor": round(gross_profit / max(gross_loss, 0.001), 2),
+        "trades": entries[-100:],
+        "config": f"SL:{sl_points} TP:{tp_points} Lot:{fixed_lot}",
+    }
+
+
+@app.route("/api/backtest", methods=["POST"])
+@login_required
+def api_backtest():
+    data = request.get_json(force=True)
+    symbol = data.get("symbol", get_setting("symbol", "XAU/USD"))
+    tf = tf_ok(data.get("tf", "15min"))
+    days = min(int(data.get("days", 7)), 60)
+    sl = safe_float(data.get("sl", 10), 10)
+    tp = safe_float(data.get("tp", 20), 20)
+    lot = safe_float(data.get("lot", 0.1), 0.1)
+    result = run_backtest(symbol, tf, days, sl, tp, lot)
+    return jsonify(ok=True, **result)
+
+
+# ============================================================
+# TELEGRAM BOT INTEGRATION
+# ============================================================
+
+def send_telegram(msg):
+    conn = db()
+    cfg = conn.execute("SELECT * FROM telegram_config WHERE id=1").fetchone()
+    conn.close()
+    if not cfg or not cfg["enabled"]:
+        return False
+    token = cfg["bot_token"]
+    chat_id = cfg["chat_id"]
+    if not token or not chat_id or not requests:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+        return True
+    except Exception:
+        return False
+
+
+@app.route("/api/telegram", methods=["GET", "POST"])
+@login_required
+def api_telegram():
+    conn = db()
+    if request.method == "POST":
+        data = request.get_json(force=True)
+        conn.execute("INSERT OR REPLACE INTO telegram_config(id,bot_token,chat_id,enabled) VALUES(1,?,?,?)",
+            (data.get("bot_token", ""), data.get("chat_id", ""), 1 if data.get("enabled") else 0))
+        conn.commit()
+        conn.close()
+        test_msg = data.get("test", False)
+        if test_msg:
+            send_telegram(f"✅ *{APP}* connected!\nTest message from server.")
+        return jsonify(ok=True)
+    cfg = conn.execute("SELECT * FROM telegram_config WHERE id=1").fetchone()
+    conn.close()
+    if cfg:
+        return jsonify(ok=True, bot_token=cfg["bot_token"], chat_id=cfg["chat_id"], enabled=bool(cfg["enabled"]))
+    return jsonify(ok=True, bot_token="", chat_id="", enabled=False)
+
+
+# ============================================================
+# DAILY SUMMARY
+# ============================================================
+
+@app.route("/api/daily-summary")
+@login_required
+def api_daily_summary():
+    rows = journal_rows()
+    today_date = today()
+    today_trades = [r for r in rows if r.get("trade_date") == today_date]
+    week_ago = (datetime.now(TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
+    week_trades = [r for r in rows if r.get("trade_date", "") >= week_ago]
+    
+    def calc_trade_set(trades):
+        closed = [t for t in trades if (t.get("result") or "").upper() in ["WIN","LOSS","BE"] or safe_float(t.get("pnl")) != 0]
+        wins = sum(1 for t in closed if safe_float(t.get("pnl")) > 0 or (t.get("result") or "").upper() == "WIN")
+        losses = sum(1 for t in closed if safe_float(t.get("pnl")) < 0 or (t.get("result") or "").upper() == "LOSS")
+        pnl = sum(safe_float(t.get("pnl")) for t in trades)
+        return {"total": len(trades), "closed": len(closed), "wins": wins, "losses": losses,
+                "winrate": round(wins / max(1, wins + losses) * 100, 1), "pnl": round(pnl, 2)}
+    
+    return jsonify(ok=True, today=calc_trade_set(today_trades), this_week=calc_trade_set(week_trades))
+
+
+# ============================================================
+# SENTIMENT GAUGE
+# ============================================================
+
+@app.route("/api/sentiment")
+@login_required
+def api_sentiment():
+    news = fundamental_bias_enhanced()
+    dxy = fetch_dxy_index()
+    calendar = fetch_economic_calendar()
+    
+    score = 0.0
+    factors = []
+    
+    # News sentiment
+    news_score = safe_float(news.get("score", 0))
+    score += news_score * 2
+    if abs(news_score) < 2:
+        factors.append({"name": "News", "score": news_score, "impact": "low", "label": "Neutral"})
+    elif news_score > 0:
+        factors.append({"name": "News", "score": news_score, "impact": "high", "label": "Bullish"})
+    else:
+        factors.append({"name": "News", "score": news_score, "impact": "high", "label": "Bearish"})
+    
+    # DXY
+    if dxy:
+        dxy_change = safe_float(dxy.get("change_pct", 0))
+        dxy_score = -dxy_change * 5
+        score += dxy_score
+        factors.append({"name": "DXY Index", "score": round(dxy_score, 1), "impact": "medium", "label": dxy.get("trend_5d", "FLAT")})
+    
+    # Trading hour
+    good_hour = is_good_trading_hour()
+    if good_hour:
+        score += 1
+        factors.append({"name": "Session", "score": 1, "impact": "low", "label": "London/New York"})
+    else:
+        score -= 0.5
+        factors.append({"name": "Session", "score": -0.5, "impact": "low", "label": "Asia (low liq)"})
+    
+    # Calendar high impact
+    if calendar.get("has_high_impact_event_soon"):
+        score -= 2
+        factors.append({"name": "Economic Calendar", "score": -2, "impact": "high", "label": "High impact event soon!"})
+    
+    total = max(-10, min(10, round(score, 1)))
+    
+    if total >= 4:
+        label = "VERY BULLISH"
+        emoji = "🟢🟢"
+    elif total >= 1.5:
+        label = "BULLISH"
+        emoji = "🟢"
+    elif total >= -1.5:
+        label = "NEUTRAL"
+        emoji = "🟡"
+    elif total >= -4:
+        label = "BEARISH"
+        emoji = "🔴"
+    else:
+        label = "VERY BEARISH"
+        emoji = "🔴🔴"
+    
+    return jsonify(ok=True, score=total, label=label, emoji=emoji, factors=factors,
+                   market_hours={"is_optimal": good_hour, "session": "London + New York" if good_hour else "Asia"})
+
+
+# ============================================================
+# TRADING CALENDAR
+# ============================================================
+
+@app.route("/api/trading-calendar")
+@login_required
+def api_trading_calendar():
+    month = request.args.get("month", today()[:7])
+    conn = db()
+    rows = [dict(x) for x in conn.execute("SELECT * FROM journal WHERE trade_date LIKE ?", (month + "%",)).fetchall()]
+    conn.close()
+    
+    days = {}
+    for r in rows:
+        d = r.get("trade_date", "")[8:10]
+        pnl = safe_float(r.get("pnl"))
+        if d not in days:
+            days[d] = {"date": d, "total": 0, "wins": 0, "losses": 0, "pnl": 0, "trades": 0}
+        days[d]["trades"] += 1
+        days[d]["pnl"] += pnl
+        if pnl > 0:
+            days[d]["wins"] += 1
+        elif pnl < 0:
+            days[d]["losses"] += 1
+        days[d]["total"] += 1
+    
+    return jsonify(ok=True, month=month, days=list(days.values()),
+                   stats={"total_days": len(days), "positive_days": sum(1 for d in days.values() if d["pnl"] > 0),
+                          "negative_days": sum(1 for d in days.values() if d["pnl"] < 0),
+                          "total_pnl": round(sum(d["pnl"] for d in days.values()), 2)})
+
+
+# ============================================================
+# RISK/REWARD MATRIX
+# ============================================================
+
+@app.route("/api/rr-matrix", methods=["POST"])
+@login_required
+def api_rr_matrix():
+    data = request.get_json(force=True)
+    entry = safe_float(data.get("entry"))
+    sl = safe_float(data.get("sl"))
+    tp = safe_float(data.get("tp"))
+    lot = safe_float(data.get("lot", 0.1))
+    balance = safe_float(data.get("balance", 1000))
+    
+    if entry <= 0 or sl <= 0 or tp <= 0 or entry == sl:
+        return jsonify(ok=False, error="Parameter tidak valid"), 400
+    
+    is_buy = entry < tp if False else True
+    is_buy = tp > entry
+    
+    risk_points = abs(entry - sl)
+    reward_points = abs(tp - entry)
+    rr_ratio = round(reward_points / max(risk_points, 0.001), 2)
+    
+    risk_amount = round(risk_points * lot, 2)
+    reward_amount = round(reward_points * lot, 2)
+    
+    scenarios = []
+    for winrate in [30, 40, 50, 60, 70]:
+        ev = (reward_amount * winrate/100) - (risk_amount * (100-winrate)/100)
+        scenarios.append({"winrate": winrate, "ev": round(ev, 2), "ev_pct": round(ev / balance * 100, 2) if balance else 0})
+    
+    return jsonify(ok=True, rr_ratio=rr_ratio, risk_points=round(risk_points, 2), reward_points=round(reward_points, 2),
+                   risk_amount=round(risk_amount, 2), reward_amount=round(reward_amount, 2),
+                   risk_pct=round(risk_amount / balance * 100, 2) if balance else 0,
+                   scenarios=scenarios)
+
+
+# ============================================================
 # HTML
 # ============================================================
 
@@ -2586,9 +3161,14 @@ tr:hover td{background:var(--card2)}
     <div class="sidebar-nav">
         <div class="nav-item active" data-tab="dashboard"><span class="icon">📈</span> Dashboard</div>
         <div class="nav-item" data-tab="chart"><span class="icon">🕯️</span> Chart</div>
+        <div class="nav-item" data-tab="signals"><span class="icon">📡</span> Signals & Alerts</div>
+        <div class="nav-item" data-tab="watchlist"><span class="icon">👁️</span> Watchlist</div>
+        <div class="nav-item" data-tab="plans"><span class="icon">📝</span> Trade Plan</div>
+        <div class="nav-item" data-tab="backtest"><span class="icon">⏪</span> Backtest</div>
         <div class="nav-item" data-tab="journal"><span class="icon">📓</span> Journal</div>
         <div class="nav-item" data-tab="analytics"><span class="icon">📊</span> Analytics</div>
         <div class="nav-item" data-tab="trades"><span class="icon">⚡</span> Active Trades</div>
+        <div class="nav-item" data-tab="telegram"><span class="icon">🤖</span> Telegram</div>
         <div class="nav-item" data-tab="settings"><span class="icon">⚙️</span> Settings</div>
     </div>
     <div class="sidebar-footer">
@@ -2807,6 +3387,90 @@ tr:hover td{background:var(--card2)}
             </div>
         </div>
 
+        <!-- ===== TAB: SIGNALS & ALERTS ===== -->
+        <div class="tab" id="tab-signals">
+            <div class="card">
+                <div class="card-header"><span class="card-title">📡 Price Alerts</span></div>
+                <div class="row" style="margin-bottom:10px;flex-wrap:wrap">
+                    <select id="alertDir" class="select"><option>ABOVE</option><option>BELOW</option></select>
+                    <input id="alertPrice" class="input" placeholder="Target Price" style="width:120px" type="number" step="0.1">
+                    <button class="btn btn-primary" onclick="addAlert()">+ Add Alert</button>
+                </div>
+                <div id="alertList"></div>
+            </div>
+            <div class="card">
+                <div class="card-header"><span class="card-title">📊 Multi-Symbol Quick View</span></div>
+                <div id="multiSymbolGrid" class="kpi-grid" style="grid-template-columns:repeat(auto-fill,minmax(160px,1fr))"></div>
+            </div>
+        </div>
+
+        <!-- ===== TAB: WATCHLIST ===== -->
+        <div class="tab" id="tab-watchlist">
+            <div class="card">
+                <div class="card-header"><span class="card-title">👁️ Watchlist</span></div>
+                <div class="row" style="margin-bottom:10px;flex-wrap:wrap">
+                    <select id="wlSymbol" class="select"><option>XAU/USD</option><option>EUR/USD</option><option>GBP/USD</option><option>AUD/USD</option><option>NZD/USD</option><option>USD/CAD</option><option>USD/CHF</option><option>USD/JPY</option><option>GBP/JPY</option><option>BTC/USD</option><option>ETH/USD</option><option>S&P500</option><option>US30</option></select>
+                    <input id="wlNote" class="input" placeholder="Note" style="width:120px">
+                    <button class="btn btn-primary" onclick="addWatchlist()">+ Add</button>
+                </div>
+                <div id="watchlistGrid" class="kpi-grid" style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr))"></div>
+            </div>
+        </div>
+
+        <!-- ===== TAB: TRADE PLANS ===== -->
+        <div class="tab" id="tab-plans">
+            <div class="card">
+                <div class="card-header"><span class="card-title">📝 Smart Trade Plan</span></div>
+                <div class="row" style="margin-bottom:10px;flex-wrap:wrap">
+                    <select id="tpSymbol" class="select"><option>XAU/USD</option><option>EUR/USD</option><option>GBP/USD</option></select>
+                    <select id="tpBias" class="select"><option>BULLISH</option><option>BEARISH</option><option>NEUTRAL</option></select>
+                    <input id="tpTF" class="input" placeholder="TF" style="width:60px" value="15min">
+                    <input id="tpEntry" class="input" placeholder="Entry Zone" style="width:100px">
+                    <input id="tpSL" class="input" placeholder="SL" style="width:80px" type="number">
+                    <input id="tpTP" class="input" placeholder="TP" style="width:80px" type="number">
+                    <select id="tpType" class="select"><option>BREAKOUT</option><option>REVERSAL</option><option>TRENDING</option><option>SCALPING</option><option>SWING</option></select>
+                    <input id="tpRationale" class="input" placeholder="Rationale" style="width:150px">
+                    <button class="btn btn-primary" onclick="saveTradePlan()">+ Create Plan</button>
+                </div>
+                <div id="tradePlansList"></div>
+            </div>
+        </div>
+
+        <!-- ===== TAB: BACKTEST ===== -->
+        <div class="tab" id="tab-backtest">
+            <div class="card">
+                <div class="card-header"><span class="card-title">⏪ Backtest Engine</span></div>
+                <div class="row" style="margin-bottom:10px;flex-wrap:wrap">
+                    <select id="btSymbol" class="select"><option>XAU/USD</option><option>EUR/USD</option><option>GBP/USD</option></select>
+                    <select id="btTF" class="select"><option value="15min">M15</option><option value="1h">H1</option><option value="4h">H4</option><option value="1day">D1</option></select>
+                    <input id="btDays" class="input" placeholder="Days" style="width:60px" value="7" type="number" min="3" max="60">
+                    <input id="btSL" class="input" placeholder="SL pts" style="width:60px" value="10" type="number">
+                    <input id="btTP" class="input" placeholder="TP pts" style="width:60px" value="20" type="number">
+                    <input id="btLot" class="input" placeholder="Lot" style="width:60px" value="0.1" type="number" step="0.01">
+                    <button class="btn btn-primary" onclick="runBacktest()">🚀 Run Backtest</button>
+                </div>
+                <div id="btLoading" style="display:none;text-align:center;padding:20px;color:var(--mut)">⏳ Running backtest...</div>
+                <div id="btResult"></div>
+            </div>
+        </div>
+
+        <!-- ===== TAB: TELEGRAM ===== -->
+        <div class="tab" id="tab-telegram">
+            <div class="card">
+                <div class="card-header"><span class="card-title">🤖 Telegram Bot Integration</span></div>
+                <div style="max-width:400px">
+                    <input id="tgToken" class="input" placeholder="Bot Token (from @BotFather)" style="width:100%">
+                    <input id="tgChatId" class="input" placeholder="Chat ID" style="width:100%">
+                    <label><input type="checkbox" id="tgEnabled"> Enable Telegram Bot</label>
+                    <div class="row" style="margin-top:8px">
+                        <button class="btn btn-primary" onclick="saveTelegram()">💾 Save</button>
+                        <button class="btn" onclick="saveTelegram(true)">📨 Test Send</button>
+                    </div>
+                    <div id="tgStatus" style="margin-top:8px;font-size:12px;color:var(--txt2)"></div>
+                </div>
+            </div>
+        </div>
+
         <!-- ===== TAB: SETTINGS ===== -->
         <div class="tab" id="tab-settings">
             <div class="card">
@@ -2942,6 +3606,10 @@ document.querySelectorAll('.nav-item').forEach(item => {
         if(this.dataset.tab === 'trades') loadActiveTrades();
         if(this.dataset.tab === 'journal') loadJournal();
         if(this.dataset.tab === 'chart') loadChartTab();
+        if(this.dataset.tab === 'signals') { loadAlerts(); loadMultiSymbol(); }
+        if(this.dataset.tab === 'watchlist') loadWatchlist();
+        if(this.dataset.tab === 'plans') loadTradePlans();
+        if(this.dataset.tab === 'telegram') loadTelegram();
         if(window.innerWidth <= 900) toggleSidebar(false);
         setTimeout(resizeCharts, 120);
     });
@@ -3843,6 +4511,218 @@ async function getIDR(usd) {
         try { const r = await fetch('/api/convert?usd=1').then(r => r.json()); idrCache = { rate: r.rate, time: Date.now() }; } catch(e) {}
     }
     return 'Rp' + (usd * idrCache.rate).toLocaleString('id-ID', {minimumFractionDigits:0,maximumFractionDigits:0});
+}
+
+// ===== NEW FEATURES =====
+
+// ---- ALERTS ----
+async function loadAlerts() {
+    try {
+        const data = await fetch('/api/alerts').then(r => r.json());
+        const list = document.getElementById('alertList');
+        if (!data.rows || data.rows.length === 0) {
+            list.innerHTML = '<div style="padding:12px;color:var(--mut);text-align:center">Belum ada alert</div>';
+            return;
+        }
+        list.innerHTML = data.rows.map(a =>
+            '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--card2);border-radius:8px;margin-bottom:4px">' +
+            '<span>' + a.direction + ' <b>$' + a.target_price + '</b> ' + (a.triggered ? '<span class="badge badge-win">TRIGGERED</span>' : '<span class="badge badge-open">ACTIVE</span>') + '</span>' +
+            '<span><span class="btn btn-danger" style="padding:2px 8px;font-size:11px" onclick="deleteAlert(' + a.id + ')">✕</span></span>' +
+            '</div>'
+        ).join('');
+    } catch(e) {}
+}
+
+async function addAlert() {
+    const dir = document.getElementById('alertDir').value;
+    const price = parseFloat(document.getElementById('alertPrice').value);
+    if (!price || price <= 0) { showToast('Masukkan target price', 'error'); return; }
+    await fetch('/api/alerts', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({direction: dir, target_price: price})});
+    document.getElementById('alertPrice').value = '';
+    showToast('Alert dibuat: ' + dir + ' $' + price, 'success');
+    loadAlerts();
+}
+
+async function deleteAlert(id) {
+    await fetch('/api/alerts/' + id, {method:'DELETE'});
+    loadAlerts();
+}
+
+// ---- MULTI-SYMBOL QUICK VIEW ----
+async function loadMultiSymbol() {
+    try {
+        const symbols = ['XAU/USD','EUR/USD','GBP/USD','USD/JPY','BTC/USD'];
+        const grid = document.getElementById('multiSymbolGrid');
+        if (!grid) return;
+        const promises = symbols.map(s => fetch('/api/market-symbol?symbol=' + s + '&tf=5min').then(r => r.json()).catch(() => null));
+        const results = await Promise.allSettled(promises);
+        grid.innerHTML = symbols.map((s, i) => {
+            const r = results[i]?.value;
+            if (!r || !r.analysis) return '<div class="kpi-box"><span class="val">' + s + '</span><span class="lbl">Loading</span></div>';
+            const a = r.analysis;
+            const color = a.signal === 'BUY' ? 'var(--green)' : a.signal === 'SELL' ? 'var(--red)' : 'var(--gold)';
+            return '<div class="kpi-box" style="border-left:3px solid ' + color + '">' +
+                '<span class="val" style="font-size:14px">' + s + '</span>' +
+                '<span class="lbl">' + a.signal + ' | ' + a.score + '%</span>' +
+                '<span style="font-size:11px;color:var(--txt2)">$' + a.price + ' | RSI:' + a.rsi + '</span>' +
+                '</div>';
+        }).join('');
+    } catch(e) {}
+}
+
+// ---- WATCHLIST ----
+async function loadWatchlist() {
+    try {
+        const data = await fetch('/api/watchlist').then(r => r.json());
+        const grid = document.getElementById('watchlistGrid');
+        if (!data.rows || data.rows.length === 0) {
+            grid.innerHTML = '<div style="padding:20px;color:var(--mut);text-align:center">Belum ada watchlist</div>';
+            return;
+        }
+        const prices = await Promise.allSettled(data.rows.map(r => fetch('/api/market-symbol?symbol=' + r.symbol + '&tf=5min').then(res => res.json())));
+        grid.innerHTML = data.rows.map((r, i) => {
+            const p = prices[i]?.value;
+            const price = p?.analysis?.price || '-';
+            const sig = p?.analysis?.signal || 'WAIT';
+            const sc = p?.analysis?.score || 0;
+            const color = sig === 'BUY' ? 'var(--green)' : sig === 'SELL' ? 'var(--red)' : 'var(--gold)';
+            return '<div class="kpi-box" style="border-left:3px solid ' + color + '">' +
+                '<span class="val" style="font-size:15px">' + r.symbol + '</span>' +
+                '<span class="lbl">$' + price + ' | ' + sig + ' ' + sc + '%</span>' +
+                (r.note ? '<span style="font-size:10px;color:var(--mut)">' + r.note + '</span>' : '') +
+                '<span class="btn btn-danger" style="padding:1px 6px;font-size:10px;margin-top:4px" onclick="deleteWatchlist(' + r.id + ')">✕</span>' +
+                '</div>';
+        }).join('');
+    } catch(e) {}
+}
+
+async function addWatchlist() {
+    const symbol = document.getElementById('wlSymbol').value;
+    const note = document.getElementById('wlNote').value;
+    await fetch('/api/watchlist', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({symbol, note})});
+    document.getElementById('wlNote').value = '';
+    showToast(symbol + ' ditambahkan ke watchlist', 'success');
+    loadWatchlist();
+}
+
+async function deleteWatchlist(id) {
+    await fetch('/api/watchlist/' + id, {method:'DELETE'});
+    loadWatchlist();
+}
+
+// ---- TRADE PLANS ----
+async function loadTradePlans() {
+    try {
+        const data = await fetch('/api/trade-plans').then(r => r.json());
+        const list = document.getElementById('tradePlansList');
+        if (!data.rows || data.rows.length === 0) {
+            list.innerHTML = '<div style="padding:12px;color:var(--mut);text-align:center">Belum ada trade plan</div>';
+            return;
+        }
+        list.innerHTML = '<div style="font-size:12px;overflow-x:auto">' +
+            '<table><tr><th>Date</th><th>Symbol</th><th>Bias</th><th>Type</th><th>Entry</th><th>SL</th><th>TP</th><th>Result</th><th></th></tr>' +
+            data.rows.map(r =>
+                '<tr><td>' + (r.created_at||'').slice(0,10) + '</td><td>' + r.symbol + '</td><td><span class="badge ' + (r.bias==='BULLISH'?'badge-win':r.bias==='BEARISH'?'badge-loss':'badge-be') + '">' + r.bias + '</span></td>' +
+                '<td>' + (r.setup_type||'') + '</td><td>' + (r.entry_zone||'') + '</td><td>' + (r.sl||'') + '</td><td>' + (r.tp||'') + '</td>' +
+                '<td>' + (r.result ? '<span class="badge ' + (r.result==='WIN'?'badge-win':r.result==='LOSS'?'badge-loss':'badge-be') + '">' + r.result + '</span>' : '<span class="badge badge-open">OPEN</span>') + '</td>' +
+                '<td>' + (!r.result ? '<span class="btn" style="padding:2px 8px;font-size:10px" onclick="closeTradePlan(' + r.id + ')">✕ Close</span>' : '') + '</td></tr>'
+            ).join('') + '</table></div>';
+    } catch(e) {}
+}
+
+async function saveTradePlan() {
+    const payload = {
+        symbol: document.getElementById('tpSymbol').value,
+        timeframe: document.getElementById('tpTF').value,
+        bias: document.getElementById('tpBias').value,
+        entry_zone: document.getElementById('tpEntry').value,
+        sl: parseFloat(document.getElementById('tpSL').value) || 0,
+        tp: parseFloat(document.getElementById('tpTP').value) || 0,
+        setup_type: document.getElementById('tpType').value,
+        rationale: document.getElementById('tpRationale').value
+    };
+    await fetch('/api/trade-plans', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    document.getElementById('tpEntry').value = '';
+    document.getElementById('tpSL').value = '';
+    document.getElementById('tpTP').value = '';
+    document.getElementById('tpRationale').value = '';
+    showToast('Trade plan dibuat', 'success');
+    loadTradePlans();
+}
+
+async function closeTradePlan(id) {
+    const r = prompt('Result (WIN/LOSS/BE):');
+    if (!r || !['WIN','LOSS','BE'].includes(r.toUpperCase())) return;
+    const pnl = parseFloat(prompt('PNL $:')) || 0;
+    await fetch('/api/trade-plans/' + id, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({result: r.toUpperCase(), pnl})});
+    showToast('Trade plan ditutup: ' + r, 'info');
+    loadTradePlans();
+}
+
+// ---- BACKTEST ----
+async function runBacktest() {
+    document.getElementById('btLoading').style.display = 'block';
+    document.getElementById('btResult').innerHTML = '';
+    const payload = {
+        symbol: document.getElementById('btSymbol').value,
+        tf: document.getElementById('btTF').value,
+        days: parseInt(document.getElementById('btDays').value) || 7,
+        sl: parseFloat(document.getElementById('btSL').value) || 10,
+        tp: parseFloat(document.getElementById('btTP').value) || 20,
+        lot: parseFloat(document.getElementById('btLot').value) || 0.1
+    };
+    try {
+        const data = await fetch('/api/backtest', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}).then(r => r.json());
+        document.getElementById('btLoading').style.display = 'none';
+        if (data.error) {
+            document.getElementById('btResult').innerHTML = '<div style="color:var(--red);padding:12px">Error: ' + data.error + '</div>';
+            return;
+        }
+        document.getElementById('btResult').innerHTML =
+            '<div class="kpi-grid" style="grid-template-columns:repeat(auto-fill,minmax(130px,1fr))">' +
+            '<div class="kpi-box"><span class="val">' + (data.total_trades||0) + '</span><span class="lbl">Trades</span></div>' +
+            '<div class="kpi-box"><span class="val" style="color:' + (data.winrate>=50?'var(--green)':'var(--red)') + '">' + data.winrate + '%</span><span class="lbl">Winrate</span></div>' +
+            '<div class="kpi-box"><span class="val">' + (data.wins||0) + '/' + (data.losses||0) + '</span><span class="lbl">W/L</span></div>' +
+            '<div class="kpi-box"><span class="val" style="color:' + (data.total_pnl>=0?'var(--green)':'var(--red)') + '">' + fmtCurrency(data.total_pnl||0) + '</span><span class="lbl">PNL</span></div>' +
+            '<div class="kpi-box"><span class="val">' + (data.profit_factor||0) + '</span><span class="lbl">Profit Factor</span></div>' +
+            '<div class="kpi-box"><span class="val" style="color:var(--red)">' + (data.max_drawdown||0) + '%</span><span class="lbl">Max DD</span></div>' +
+            '<div class="kpi-box"><span class="val" style="font-size:12px">' + data.config + '</span><span class="lbl">Config</span></div>' +
+            '</div>' +
+            (data.trades && data.trades.length > 0 ?
+            '<div style="margin-top:8px;font-size:11px;max-height:200px;overflow-y:auto">' +
+            '<table><tr><th>Time</th><th>Side</th><th>Entry</th><th>Exit</th><th>PNL</th><th>Result</th></tr>' +
+            data.trades.slice(-20).map(t => '<tr><td>' + (t.entry_time||'').slice(5,16) + '</td><td>' + t.side + '</td><td>' + t.entry_price + '</td><td>' + t.exit_price + '</td><td style="color:' + (t.pnl>=0?'var(--green)':'var(--red)') + '">' + fmtCurrency(t.pnl) + '</td><td><span class="badge ' + (t.result==='WIN'?'badge-win':'badge-loss') + '">' + t.result + '</span></td></tr>').join('') +
+            '</table></div>' : '') +
+            '<div style="margin-top:8px;font-size:11px;color:var(--txt2)">Config: ' + data.config + ' | Symbol: ' + data.symbol + ' TF: ' + data.timeframe + '</div>';
+    } catch(e) {
+        document.getElementById('btLoading').style.display = 'none';
+        document.getElementById('btResult').innerHTML = '<div style="color:var(--red);padding:12px">Gagal menjalankan backtest</div>';
+    }
+}
+
+// ---- TELEGRAM ----
+async function loadTelegram() {
+    try {
+        const data = await fetch('/api/telegram').then(r => r.json());
+        document.getElementById('tgToken').value = data.bot_token || '';
+        document.getElementById('tgChatId').value = data.chat_id || '';
+        document.getElementById('tgEnabled').checked = !!data.enabled;
+        document.getElementById('tgStatus').textContent = data.enabled ? '✅ Telegram aktif' : 'ℹ️ Telegram nonaktif';
+    } catch(e) {}
+}
+
+async function saveTelegram(test) {
+    const payload = {
+        bot_token: document.getElementById('tgToken').value,
+        chat_id: document.getElementById('tgChatId').value,
+        enabled: document.getElementById('tgEnabled').checked,
+        test: !!test
+    };
+    const data = await fetch('/api/telegram', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}).then(r => r.json());
+    if (data.ok) {
+        document.getElementById('tgStatus').textContent = test ? '📨 Test message sent!' : '✅ Telegram config saved';
+        showToast(test ? 'Test message sent!' : 'Telegram config saved', 'success');
+    }
 }
 
 // ===== INIT =====
