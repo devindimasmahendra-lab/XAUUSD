@@ -146,6 +146,18 @@ def init_db():
         "news_api_key": os.getenv("NEWS_API_KEY", ""),
         "news_url": "",
         "news_enabled": "1",
+        "metals_api_key": os.getenv("METALS_API_KEY", ""),
+        # AI Parameters
+        "ai_sensitivity": "1.0",
+        "ai_confidence_threshold": "65",
+        "ai_risk_mode": "balanced",
+        "ai_trend_weight": "1.0",
+        "ai_momentum_weight": "1.0",
+        "ai_news_weight": "1.0",
+        "ai_use_dxy": "1",
+        "ai_use_calendar": "1",
+        "ai_use_divergence": "1",
+        "ai_use_candlestick": "1",
     }
 
     for k, v in defaults.items():
@@ -1015,7 +1027,26 @@ def analyze(candles, tf="15min"):
     memory = ai_memory_summary(tf)
     news_bias = fundamental_bias()
     fundamental_enh = fundamental_bias_enhanced()
-    reason.append(f"🧠 AI Profile {tf}: {profile['name']}")
+    # ===== AI PARAMETERS =====
+    ai_sensitivity = safe_float(get_setting("ai_sensitivity", "1.0"), 1.0)
+    ai_confidence_threshold = safe_float(get_setting("ai_confidence_threshold", "65"), 65)
+    ai_risk_mode = get_setting("ai_risk_mode", "balanced")
+    
+    # Adjust sensitivity based on risk mode
+    risk_mode_mult = {
+        "conservative": 0.7,  # Lower sensitivity, fewer trades
+        "balanced": 1.0,      # Normal
+        "aggressive": 1.3     # Higher sensitivity, more trades
+    }.get(ai_risk_mode, 1.0)
+    
+    # Apply sensitivity to initial scoring
+    # sensitivity = 1.0 means normal, <1.0 more conservative, >1.0 more aggressive
+    sensitivity_mult = ai_sensitivity * risk_mode_mult
+    
+    # Adjust confidence threshold (higher = fewer but stronger signals)
+    confidence_boost = max(0, (ai_confidence_threshold - 65) * 0.5)
+    
+    reason.append(f"🧠 AI Profile {tf}: {profile['name']} | Sens: {ai_sensitivity}x | Mode: {ai_risk_mode}")
     
     nearest_support, nearest_resistance = detect_support_resistance(candles, 15)
     if nearest_support:
@@ -1271,7 +1302,13 @@ def analyze(candles, tf="15min"):
         daily_guard["status"] = "CAUTION"
         warnings.append("⚠️ Daily guard: loss streak tinggi, kurangi risiko")
     
-    total_score = 50 + trend_score + momentum_score
+    # ===== APPLY AI PARAMETERS TO SCORING =====
+    # Apply sensitivity multiplier to scores
+    trend_score = trend_score * sensitivity_mult
+    momentum_score = momentum_score * sensitivity_mult
+    
+    # Apply confidence threshold boost (raises the bar for signals)
+    total_score = 50 + trend_score + momentum_score - confidence_boost
     total_score = max(0, min(100, total_score))
     
     signal = "WAIT"
@@ -1529,6 +1566,18 @@ def api_settings():
         "news_api_key",
         "news_url",
         "news_enabled",
+        "metals_api_key",
+        # AI Parameters
+        "ai_sensitivity",
+        "ai_confidence_threshold",
+        "ai_risk_mode",
+        "ai_trend_weight",
+        "ai_momentum_weight",
+        "ai_news_weight",
+        "ai_use_dxy",
+        "ai_use_calendar",
+        "ai_use_divergence",
+        "ai_use_candlestick",
     ]
 
     if request.method == "POST":
@@ -2073,29 +2122,29 @@ MAIN_HTML = r'''
 <style>
 /* ===== CSS VARIABLES ===== */
 :root{
-    --bg:#f0f2f5;
-    --side:#fff;
-    --card:#fff;
-    --card2:#f8fafc;
-    --card3:#f1f5f9;
+    --bg:#f8fafc;
+    --side:#ffffff;
+    --card:#ffffff;
+    --card2:#f1f5f9;
+    --card3:#e2e8f0;
     --txt:#0f172a;
     --txt2:#475569;
     --mut:#94a3b8;
     --line:#e2e8f0;
-    --accent:#1e293b;
-    --green:#059669;
+    --accent:#6366f1;
+    --green:#10b981;
     --green-bg:#ecfdf5;
-    --red:#dc2626;
+    --red:#ef4444;
     --red-bg:#fef2f2;
-    --gold:#ca8a04;
-    --gold-bg:#fefce8;
-    --blue:#2563eb;
+    --gold:#f59e0b;
+    --gold-bg:#fffbeb;
+    --blue:#3b82f6;
     --blue-bg:#eff6ff;
     --shadow:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
     --shadow-lg:0 10px 40px rgba(0,0,0,.08);
-    --radius:12px;
-    --radius-lg:16px;
-    --sidebar-w:220px;
+    --radius:10px;
+    --radius-lg:14px;
+    --sidebar-w:250px;
 }
 
 html[data-theme="dark"]{
@@ -2240,14 +2289,18 @@ body{
     padding:16px 20px;
     box-shadow:var(--shadow);
     margin-bottom:14px;
+    transition:box-shadow .2s,border-color .2s;
 }
+.card:hover{box-shadow:var(--shadow-lg);border-color:var(--mut)}
 .card-header{
     display:flex;
     align-items:center;
     justify-content:space-between;
     margin-bottom:12px;
+    gap:12px;
+    flex-wrap:wrap;
 }
-.card-title{font-weight:600;font-size:15px;color:var(--txt)}
+.card-title{font-weight:600;font-size:15px;color:var(--txt);letter-spacing:-.2px}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .btn{
     background:var(--card2);
@@ -2258,23 +2311,24 @@ body{
     cursor:pointer;
     font-weight:500;
     font-size:13px;
-    transition:all .15s;
+    transition:all .15s ease;
     display:inline-flex;
     align-items:center;
     gap:5px;
     white-space:nowrap;
+    font-family:inherit;
 }
-.btn:hover{background:var(--card3);border-color:var(--mut)}
-.btn:active{transform:scale(.97)}
+.btn:hover{background:var(--card3);border-color:var(--mut);transform:translateY(-1px)}
+.btn:active{transform:scale(.97) translateY(0)}
 .btn-primary{
-    background:var(--gold);
+    background:linear-gradient(135deg,var(--gold),#d97706);
     color:#0f172a;
-    border-color:var(--gold);
+    border-color:transparent;
     font-weight:600;
 }
-.btn-primary:hover{filter:brightness(1.1)}
+.btn-primary:hover{filter:brightness(1.1);box-shadow:0 2px 8px rgba(245,158,11,.3)}
 .btn-danger{background:var(--red-bg);color:var(--red);border-color:transparent}
-.btn-danger:hover{background:var(--red);color:#fff}
+.btn-danger:hover{background:var(--red);color:#fff;box-shadow:0 2px 8px rgba(239,68,68,.3)}
 .input, .select{
     background:var(--card2);
     color:var(--txt);
@@ -2283,62 +2337,81 @@ body{
     padding:9px 12px;
     font-size:13px;
     outline:none;
-    transition:border-color .15s;
+    transition:border-color .15s,box-shadow .15s;
+    font-family:inherit;
 }
-.input:focus,.select:focus{border-color:var(--gold)}
+.input:focus,.select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(99,102,241,.1)}
 .input::placeholder{color:var(--mut)}
 .select{cursor:pointer;appearance:none;padding-right:28px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center}
-label{gap:5px;display:inline-flex;align-items:center;cursor:pointer}
+label{gap:6px;display:inline-flex;align-items:center;cursor:pointer;font-weight:500}
 
 /* ===== KPI GRID ===== */
 .kpi-grid{
     display:grid;
-    grid-template-columns:repeat(auto-fill,minmax(140px,1fr));
+    grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
     gap:10px;
 }
 .kpi-box{
     background:var(--card2);
     border:1px solid var(--line);
     border-radius:var(--radius);
-    padding:12px;
+    padding:14px;
     text-align:center;
+    transition:all .2s ease;
 }
+.kpi-box:hover{background:var(--card3);border-color:var(--mut);transform:translateY(-2px);box-shadow:var(--shadow-lg)}
 .kpi-box .val{
     display:block;
     font-size:18px;
     font-weight:700;
     line-height:1.3;
+    letter-spacing:-.3px;
 }
 .kpi-box .lbl{
-    font-size:11px;
+    font-size:10px;
     color:var(--mut);
     text-transform:uppercase;
-    letter-spacing:.3px;
+    letter-spacing:.4px;
+    margin-top:2px;
 }
 
 /* ===== SIGNAL DISPLAY ===== */
 .signal-box{
     text-align:center;
-    padding:20px;
+    padding:24px;
     border-radius:var(--radius-lg);
     background:var(--card2);
     border:2px solid var(--line);
     margin-bottom:10px;
-    transition:all .3s;
+    transition:all .3s ease;
+    position:relative;
+    overflow:hidden;
+}
+.signal-box::before{
+    content:'';
+    position:absolute;
+    top:0;left:0;right:0;
+    height:3px;
+    background:linear-gradient(90deg, transparent, var(--gold), transparent);
+    opacity:.6;
 }
 .signal-box.buy{border-color:var(--green);background:var(--green-bg)}
+.signal-box.buy::before{background:linear-gradient(90deg, transparent, var(--green), transparent)}
 .signal-box.sell{border-color:var(--red);background:var(--red-bg)}
+.signal-box.sell::before{background:linear-gradient(90deg, transparent, var(--red), transparent)}
 .signal-box.wait{border-color:var(--gold);background:var(--gold-bg)}
 .signal-text{
     font-size:42px;
     font-weight:900;
     letter-spacing:-1px;
+    animation:pulse 2s ease-in-out infinite;
 }
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.8}}
 .signal-text.buy{color:var(--green)}
 .signal-text.sell{color:var(--red)}
 .signal-text.wait{color:var(--gold)}
 .signal-score{font-size:13px;color:var(--txt2);margin-top:4px}
-.signal-meta{display:flex;gap:16px;justify-content:center;margin-top:8px;font-size:13px;color:var(--txt2)}
+.signal-meta{display:flex;gap:16px;justify-content:center;margin-top:8px;font-size:13px;color:var(--txt2);flex-wrap:wrap}
 .signal-meta b{color:var(--txt)}
 
 /* ===== CHART ===== */
@@ -2741,6 +2814,7 @@ tr:hover td{background:var(--card2)}
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:500px">
                     <input id="set_symbol" class="input" placeholder="Symbol XAU/USD">
                     <input id="set_td" class="input" placeholder="Twelve Data API Key">
+                    <input id="set_metals" class="input" placeholder="Metals API Key (api.metals.live) - opsional">
                     <input id="set_risk" class="input" placeholder="Risk %">
                     <input id="set_pip" class="input" placeholder="Pip value per lot">
                     <input id="set_refresh" class="input" placeholder="Refresh seconds">
@@ -2756,22 +2830,13 @@ tr:hover td{background:var(--card2)}
                     <button class="btn btn-primary" onclick="saveSettings()">💾 Save</button>
                 </div>
             </div>
-            <!-- Virtual Trading: 1 menu sederhana -->
+            <!-- Virtual Trading: sederhana -->
             <div class="card">
                 <div class="card-header"><span class="card-title">💰 Virtual Trading</span></div>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:500px">
-                    <div>
-                        <label style="font-size:12px;color:var(--txt2);display:block;margin-bottom:4px">Saldo Awal (Initial Balance)</label>
-                        <input id="set_balance" class="input" placeholder="Initial Balance" style="width:100%">
-                    </div>
-                    <div>
-                        <label style="font-size:12px;color:var(--txt2);display:block;margin-bottom:4px">Credit Balance</label>
-                        <input id="set_credit" class="input" placeholder="Credit Balance" style="width:100%">
-                    </div>
-                </div>
-                <div class="row" style="margin-top:10px;gap:8px">
-                    <button class="btn btn-primary" onclick="setBalanceCredit()">💾 Set Credit</button>
-                    <button class="btn" onclick="resetBalanceCredit()">🔄 Reset</button>
+                <div class="row" style="gap:8px;flex-wrap:wrap">
+                    <input id="set_balance" class="input" placeholder="Set Balance" style="width:120px" type="number" step="100">
+                    <button class="btn btn-primary" onclick="setBalance()">💾 Set</button>
+                    <button class="btn" onclick="resetBalance()">🔄 Reset ke 1000</button>
                 </div>
             </div>
             <div class="card">
@@ -3074,15 +3139,19 @@ function renderStats(s){
     document.getElementById('r_balance').value = s.balance_credit ?? s.balance;
 }
 
-async function setBalanceCredit(){
-    const amount = document.getElementById('set_credit').value;
+async function setBalance(){
+    const amount = parseFloat(document.getElementById('set_balance').value);
+    if(!amount || amount <= 0){
+        showToast('Masukkan jumlah balance yang valid', 'error');
+        return;
+    }
     const r = await fetch('/api/balance-credit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({amount})}).then(r => r.json());
-    if(r.ok){ showToast('Balance credit di-set: ' + fmtCurrency(r.balance_credit), 'success'); renderStats(r.stats); }
+    if(r.ok){ showToast('Balance di-set: ' + fmtCurrency(r.balance_credit), 'success'); renderStats(r.stats); document.getElementById('set_balance').value = ''; }
 }
 
-async function resetBalanceCredit(){
+async function resetBalance(){
     const r = await fetch('/api/balance-credit/reset', {method:'POST'}).then(r => r.json());
-    if(r.ok){ showToast('Balance credit di-reset: ' + fmtCurrency(r.balance_credit), 'success'); renderStats(r.stats); }
+    if(r.ok){ showToast('Balance di-reset: ' + fmtCurrency(r.balance_credit), 'success'); renderStats(r.stats); }
 }
 
 // ===== LOAD JOURNAL =====
@@ -3194,15 +3263,28 @@ async function calcRisk(){
 
 // ===== ACTIVE TRADES =====
 async function saveActiveTrade(){
-    await fetch('/api/active-trades', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+    const entry = parseFloat(document.getElementById('at_entry').value);
+    const lot = parseFloat(document.getElementById('at_lot').value);
+    if(!entry || entry <= 0){
+        showToast('Entry tidak valid', 'error');
+        return;
+    }
+    if(!lot || lot <= 0){
+        showToast('Lot tidak valid', 'error');
+        return;
+    }
+    const payload = {
         timeframe: currentTF,
         side: document.getElementById('at_side').value,
-        entry: document.getElementById('at_entry').value,
-        sl: document.getElementById('at_sl').value,
-        tp: document.getElementById('at_tp').value,
-        lot: document.getElementById('at_lot').value,
+        entry: entry,
+        lot: lot,
         note: document.getElementById('at_note').value
-    })});
+    };
+    const sl = parseFloat(document.getElementById('at_sl').value);
+    if(sl > 0) payload.sl = sl;
+    const tp = parseFloat(document.getElementById('at_tp').value);
+    if(tp > 0) payload.tp = tp;
+    await fetch('/api/active-trades', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
     document.getElementById('at_entry').value='';
     document.getElementById('at_sl').value='';
     document.getElementById('at_tp').value='';
@@ -3210,6 +3292,7 @@ async function saveActiveTrade(){
     document.getElementById('at_note').value='';
     showToast('Trade aktif tersimpan', 'success');
     loadActiveTrades();
+    drawPositionLines();
 }
 
 // ===== OPEN TRADE FROM SIGNAL (Quick one-click) =====
@@ -3222,10 +3305,6 @@ async function openTradeFromSignal(){
         showToast('Signal ditahan: ' + lastAnalysis.no_trade_reasons.join(', '), 'error');
         return;
     }
-    // Auto-calculate lot based on risk
-    const balance = parseFloat(document.getElementById('r_balance').value.replace(/[^0-9.-]/g,'')) || 1000;
-    const riskPct = parseFloat(document.getElementById('set_risk').value || 1);
-    const riskAmt = balance * riskPct / 100;
     const entry = lastAnalysis.entry;
     const sl = lastAnalysis.sl;
     if(!entry || !sl){
@@ -3234,20 +3313,32 @@ async function openTradeFromSignal(){
     }
     const distance = Math.abs(entry - sl);
     const pipVal = parseFloat(document.getElementById('set_pip').value || 1);
-    const lot = Math.round(riskAmt / Math.max(distance * pipVal, 0.00001) * 1000) / 1000;
+    
+    // Cek manual lot input terlebih dahulu
+    const manualLot = parseFloat(document.getElementById('manualLot').value);
+    let lot;
+    if(manualLot && manualLot > 0){
+        lot = Math.min(Math.max(manualLot, 0.01), 5);
+    } else {
+        const balance = parseFloat(document.getElementById('r_balance').value.replace(/[^0-9.-]/g,'')) || 1000;
+        const riskPct = parseFloat(document.getElementById('set_risk').value || 1);
+        const riskAmt = balance * riskPct / 100;
+        lot = Math.round(riskAmt / Math.max(distance * pipVal, 0.00001) * 1000) / 1000;
+        lot = Math.min(Math.max(lot, 0.01), 5);
+    }
     
     await fetch('/api/active-trades', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
         timeframe: currentTF,
         side: lastAnalysis.signal,
-        entry: lastAnalysis.entry,
-        sl: lastAnalysis.sl,
+        entry: entry,
+        sl: sl,
         tp: lastAnalysis.tp,
-        lot: Math.min(Math.max(lot, 0.01), 5),
-        note: 'Signal ' + lastAnalysis.quality_grade + ' | Score:' + lastAnalysis.score
+        lot: lot,
+        note: 'Signal ' + lastAnalysis.quality_grade + ' | Score:' + lastAnalysis.score + (manualLot && manualLot > 0 ? ' (Manual Lot)' : '')
     })});
-    showToast('⚡ Trade dibuka: ' + lastAnalysis.signal + ' @ ' + fmtPrice(lastAnalysis.entry) + ' (Lot: ' + lot.toFixed(2) + ')', 'success');
+    showToast('⚡ Trade dibuka: ' + lastAnalysis.signal + ' @ ' + fmtPrice(entry) + ' (Lot: ' + lot.toFixed(2) + ')', 'success');
     loadActiveTrades();
-    loadMarket();
+    drawPositionLines();
 }
 
 async function loadActiveTrades(){
@@ -3343,6 +3434,7 @@ async function closeTrade(id){
             showToast('Trade closed: ' + r.result + ' | PNL: ' + fmtCurrency(r.pnl), r.result === 'WIN' ? 'success' : 'info');
             loadActiveTrades();
             loadJournal();
+            drawPositionLines();
         } else {
             showToast(r.error || 'Gagal close', 'error');
         }
@@ -3357,6 +3449,7 @@ async function saveSettings(){
     await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
         symbol: document.getElementById('set_symbol').value,
         twelvedata_api_key: document.getElementById('set_td').value,
+        metals_api_key: document.getElementById('set_metals').value,
         initial_balance: document.getElementById('set_balance').value,
         risk_percent: document.getElementById('set_risk').value,
         pip_value_per_lot: document.getElementById('set_pip').value,
@@ -3402,26 +3495,18 @@ async function quickTrade(side){
         lot = Math.min(Math.max(lot, 0.01), 5);
     }
     
-    try {
-        const res = await fetch('/api/active-trades', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
-            timeframe: currentTF,
-            side: side,
-            entry: last,
-            sl: round(sl, 2),
-            tp: round(tp, 2),
-            lot: lot,
-            note: 'Quick ' + side + (manualLot && manualLot > 0 ? ' (Manual Lot)' : '')
-        })}).then(r => r.json());
-        
-        if(res.ok !== false){
-            showToast('⚡ ' + side + ' @ ' + fmtPrice(last) + ' | Lot: ' + lot.toFixed(2), 'success');
-            loadActiveTrades();
-        } else {
-            showToast('Gagal buka trade: ' + (res.error || 'Unknown'), 'error');
-        }
-    } catch(e){
-        showToast('Error: ' + e.message, 'error');
-    }
+    await fetch('/api/active-trades', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+        timeframe: currentTF,
+        side: side,
+        entry: last,
+        sl: round(sl, 2),
+        tp: round(tp, 2),
+        lot: lot,
+        note: 'Quick ' + side + (manualLot && manualLot > 0 ? ' (Manual Lot)' : '')
+    })});
+    
+    showToast('⚡ ' + side + ' @ ' + fmtPrice(last) + ' | Lot: ' + lot.toFixed(2), 'success');
+    loadActiveTrades();
 }
 
 function round(val, dec){
@@ -3616,10 +3701,21 @@ function changeCandleType(type) {
     if (!rawCandles.length) return;
     let data = type === 'heiken' ? heikinAshi(rawCandles) : rawCandles;
 
-    // Remove old series first
-    chartRef.removeSeries(candlesRef);
-    if (e20Ref) chartRef.removeSeries(e20Ref);
-    if (e50Ref) chartRef.removeSeries(e50Ref);
+    // Bersihkan position lines lama (stale references)
+    posLineRefs.forEach(ref => {
+        try { chartRef.removeSeries(ref); } catch(e){}
+    });
+    posLineRefs = [];
+
+    // Bersihkan marker pada series lama (jika bisa)
+    try { candlesRef.setMarkers([]); } catch(e){}
+
+    // Remove old series
+    try { chartRef.removeSeries(candlesRef); } catch(e){}
+    try { if(e20Ref) chartRef.removeSeries(e20Ref); } catch(e){}
+    try { if(e50Ref) chartRef.removeSeries(e50Ref); } catch(e){}
+    e20Ref = null;
+    e50Ref = null;
 
     if (type === 'line') {
         candlesRef = chartRef.addLineSeries({ color: '#2563eb', lineWidth: 2, priceFormat: { type: 'price' } });
@@ -3629,17 +3725,20 @@ function changeCandleType(type) {
         candlesRef.setData(data.map(x => ({ time: x.time, value: x.close })));
     } else {
         candleType = type;
-        const isHA = type === 'heiken';
         candlesRef = chartRef.addCandlestickSeries({ upColor: '#e11d48', downColor: '#059669', borderVisible: false, wickUpColor: '#e11d48', wickDownColor: '#059669' });
         candlesRef.setData(data);
-        // Re-add EMA series for candle/area type
+        // Re-add EMA series
         e20Ref = chartRef.addLineSeries({color:'#ca8a04', lineWidth:2});
         e50Ref = chartRef.addLineSeries({color:'#2563eb', lineWidth:2});
         const closes = data.map(x => x.close);
-        e20Ref.setData(data.map((x, i) => ({time: x.time, value: ema(closes, 20)[i]})));
-        e50Ref.setData(data.map((x, i) => ({time: x.time, value: ema(closes, 50)[i]})));
+        const ema20Vals = ema(closes, 20);
+        const ema50Vals = ema(closes, 50);
+        e20Ref.setData(data.map((x, i) => ({time: x.time, value: ema20Vals[i]})));
+        e50Ref.setData(data.map((x, i) => ({time: x.time, value: ema50Vals[i]})));
     }
     if (type !== 'candle' && type !== 'heiken') {
+        chartRef.timeScale().fitContent();
+    } else {
         chartRef.timeScale().fitContent();
     }
 }
@@ -3648,7 +3747,6 @@ function changeCandleType(type) {
 let posLineRefs = [];
 let posMarkers = [];
 async function drawPositionLines(){
-    // Remove old position lines
     posLineRefs.forEach(ref => {
         try { chartRef.removeSeries(ref); } catch(e){}
     });
@@ -3665,9 +3763,8 @@ async function drawPositionLines(){
         const chartEndTime = rawCandles.length > 0 ? rawCandles[rawCandles.length - 1].time : currentTime;
         
         let markers = [];
-        const now = Date.now();
         
-        data.rows.forEach((r, idx) => {
+        data.rows.forEach(r => {
             const isBuy = r.side === 'BUY';
             const entryColor = isBuy ? '#059669' : '#dc2626';
             const slColor = '#ea580c';
@@ -3680,7 +3777,7 @@ async function drawPositionLines(){
                 lineStyle: 2,
                 lastValueVisible: true,
                 priceLineVisible: false,
-                title: (isBuy ? '▲ ENTRY ' : '▼ ENTRY ') + (idx + 1),
+                title: isBuy ? '▲ ENTRY' : '▼ ENTRY',
             });
             entryLine.setData([
                 {time: firstCandleTime, value: r.entry},
@@ -3696,7 +3793,7 @@ async function drawPositionLines(){
                     lineStyle: 2,
                     lastValueVisible: true,
                     priceLineVisible: false,
-                    title: 'SL ' + (idx + 1),
+                    title: 'SL',
                 });
                 slLine.setData([
                     {time: firstCandleTime, value: r.sl},
@@ -3713,7 +3810,7 @@ async function drawPositionLines(){
                     lineStyle: 2,
                     lastValueVisible: true,
                     priceLineVisible: false,
-                    title: 'TP ' + (idx + 1),
+                    title: 'TP',
                 });
                 tpLine.setData([
                     {time: firstCandleTime, value: r.tp},
@@ -3723,14 +3820,13 @@ async function drawPositionLines(){
             }
             
             // Add marker at entry position (use middle of visible chart area)
-            // Offset each marker slightly so they don't overlap
-            const markerTime = Math.floor((firstCandleTime + chartEndTime) / 2) + (idx * 60);
+            const markerTime = (r.created_at) ? Math.floor(new Date(r.created_at.replace(' ', 'T')).getTime() / 1000) : Math.floor((firstCandleTime + chartEndTime) / 2);
             markers.push({
                 time: markerTime,
                 position: isBuy ? 'belowBar' : 'aboveBar',
                 color: entryColor,
                 shape: isBuy ? 'arrowUp' : 'arrowDown',
-                text: (isBuy ? 'BUY' : 'SELL') + ' #' + (idx + 1) + ' $' + r.entry,
+                text: isBuy ? 'BUY $' + r.entry : 'SELL $' + r.entry,
             });
         });
         
@@ -3767,7 +3863,6 @@ function init(){
         document.getElementById('set_symbol').value = s.symbol;
         document.getElementById('set_td').value = s.twelvedata_api_key;
         document.getElementById('set_balance').value = s.initial_balance;
-        document.getElementById('set_credit').value = s.balance_credit || s.initial_balance;
         document.getElementById('set_risk').value = s.risk_percent;
         document.getElementById('set_pip').value = s.pip_value_per_lot;
         document.getElementById('set_refresh').value = s.refresh_seconds;
